@@ -52,14 +52,8 @@ echo "Включаем автозапуск youtubeUnblock..."
 /etc/init.d/youtubeUnblock enable
 [ $? -eq 0 ] && echo "  youtubeUnblock настроен на автозапуск" || { echo "  Ошибка включения автозапуска youtubeUnblock"; exit 1; }
 
-# Предлагаем перезагрузить систему для применения youtubeUnblock
-echo "Желаете перезагрузить систему для применения youtubeUnblock? (y/N)"
-read ans
-if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-    echo "Перезагрузка системы..."
-    reboot
-    exit 0
-fi
+# Блок перезагрузки системы удален
+# Если требуется, можно добавить инструкцию о том, что перезагрузка должна выполняться вручную.
 
 # Шаг 7. Скачивание luci-app-youtubeUnblock
 echo "Скачиваем пакет luci-app-youtubeUnblock..."
