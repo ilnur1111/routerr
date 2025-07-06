@@ -1,11 +1,13 @@
 #!/bin/sh
-# opera_region_tester.sh — v1.3 (07-Jul-2025) для OpenWrt/BusyBox
+# opera_region_tester.sh — v1.4 (07-Jul-2025)
+# Тест regional pools (EU / AM / AS) и патчит init OpenWrt безопасно.
+
 set -e
 
 PORT=18080
 PROXY_URL="http://127.0.0.1:$PORT"
 TMPDIR="$(mktemp -d /tmp/opera_region_test.XXXXXX)"
-SIZE=5000000                                # 5 MB
+SIZE=5000000
 TEST_URL="https://speed.cloudflare.com/__down?bytes=${SIZE}"
 
 need_root()  { [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }; }
@@ -16,20 +18,20 @@ get_regions(){
 }
 kill_proxy(){ pkill -q opera-proxy 2>/dev/null || true; }
 
-run_proxy_tmp(){                             # $1 region
+run_proxy_tmp(){                     # $1 region
     kill_proxy
     "$OPERA_BIN" -country "$1" -bind-address 127.0.0.1:$PORT >/dev/null 2>&1 &
-    # ждём порт через netstat (универсально)
     for _ in $(seq 1 12); do
         netstat -tn 2>/dev/null | grep -q "127\.0\.0\.1:$PORT" && break
         sleep 1
     done
 }
 
-measure_region(){                            # $1 region
+measure_region(){                    # $1 region
     r=$1; echo "=== Testing $r ==="
     run_proxy_tmp "$r"
-    t=$( { time -p curl -s -o /dev/null -x "$PROXY_URL" "$TEST_URL"; } 2>&1 | awk '/real/{print $2}' )
+    t=$( { time -p curl -s -o /dev/null -x "$PROXY_URL" "$TEST_URL"; } 2>&1 |
+         awk '/real/ {print $2}' )
     [ -n "$t" ] || { echo "$r 9999 0" >>"$TMPDIR/results.txt"; return; }
     dl=$(awk -v sz=$SIZE -v tt=$t 'BEGIN{printf "%.1f", (sz*8)/(tt*1000000)}')
     echo "$r $t $dl" >>"$TMPDIR/results.txt"
@@ -38,22 +40,25 @@ measure_region(){                            # $1 region
 print_results(){
     echo; echo "===== RESULTS ====="
     printf "%-4s %-10s %-10s\n" Reg Time_s DL_Mbps
-    sort -k3 -nr "$TMPDIR/results.txt" | while read r t d; do printf "%-4s %-10s %-10s\n" "$r" "$t" "$d"; done
+    sort -k3 -nr "$TMPDIR/results.txt" |
+        while read r t d; do printf "%-4s %-10s %-10s\n" "$r" "$t" "$d"; done
     BEST=$(sort -k3 -nr "$TMPDIR/results.txt" | head -n1 | awk '{print $1}')
     echo; echo "Best region: $BEST"
 }
 
-patch_init(){                                # $1 region (EU/AM/AS)
+patch_init(){                        # $1 region
     INIT=/etc/init.d/opera-proxy
-    # убираем любые старые -country XX
-    sed -i -E 's@-country[[:space:]]+[A-Z]{2}@@' "$INIT"
+    sed -i -E 's@-country[[:space:]]+[A-Z]{2}@@g' "$INIT"     # убираем старые
 
     if grep -q 'procd_set_param[[:space:]]\+command.*opera-proxy' "$INIT"; then
-        # схема A — procd_set_param command /usr/bin/opera-proxy
-        sed -i -E "s@(procd_set_param[[:space:]]+command[[:space:]]+[^ ]*opera-proxy)@\1 -country $1@" "$INIT"
+        # Схема A — параметр прямо в procd_set_param
+        sed -i -E "s@(procd_set_param[[:space:]]+command[^\n]*opera-proxy)@\1 -country $1@" "$INIT"
     elif grep -q '^PROG=.*opera-proxy' "$INIT"; then
-        # схема B — переменная PROG=/usr/bin/opera-proxy
-        sed -i -E "s@^(PROG=.*opera-proxy)(.*)@\1 -country $1\2@" "$INIT"
+        # Схема B — переменная PROG=
+        #  1) вытаскиваем текущий путь
+        OP_BIN=$(grep '^PROG=' "$INIT" | head -n1 | sed -E 's/^PROG=//;s/[\" ]//g')
+        #  2) заменяем всю строку
+        sed -i -E "s@^PROG=.*opera-proxy.*@PROG=\"${OP_BIN} -country $1\"@" "$INIT"
     else
         echo "ERROR: cannot patch $INIT"; exit 1
     fi
@@ -81,13 +86,12 @@ main(){
 
     if [ -n "$REG_OVERRIDE" ]; then
         CHOSEN=$REG_OVERRIDE
-        echo "Non-interactive: region $CHOSEN"
+        echo "Non-interactive: $CHOSEN"
     else
         echo; echo "Select region (0 = best):"
         idx=1; for r in $REGIONS; do echo "[$idx] $r"; idx=$((idx+1)); done
         echo "[0] $BEST (recommended)"
-        printf "> "
-        read -r CHOICE < /dev/tty
+        printf "> "; read -r CHOICE < /dev/tty
         [ "$CHOICE" = "0" ] && CHOSEN=$BEST || {
             idx=1; for r in $REGIONS; do [ "$idx" = "$CHOICE" ] && CHOSEN=$r; idx=$((idx+1)); done
         }
