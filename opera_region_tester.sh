@@ -1,125 +1,106 @@
 #!/bin/sh
-# opera_region_tester.sh  —  тест всех регионов opera-proxy и установка лучшего/выбранного
+# opera_region_tester.sh — тест EU / AM / AS, сохраняет выбранный регион
 set -e
 
 PORT=18080
 PROXY_URL="http://127.0.0.1:$PORT"
 TMPDIR=/tmp/opera_region_test
+SIZE=5000000                                   # 5 МБ
+TEST_URL="https://speed.cloudflare.com/__down?bytes=${SIZE}"
+
 mkdir -p "$TMPDIR"
 
-### ──────────────────────── базовые проверки ─────────────────────────
-need_root() { [ "$(id -u)" -eq 0 ] || { echo "🚫  Запустите скрипт от root!"; exit 1; }; }
+need_root() { [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 1; }; }
 
 check_opera() {
-    OPERA_BIN="$(command -v opera-proxy || true)"
-    [ -n "$OPERA_BIN" ] || { echo "🚫  opera-proxy не найден. Установите пакет и повторите."; exit 1; }
-}
-
-install_speedtest() {
-    if ! command -v speedtest-cli >/dev/null 2>&1; then
-        echo "▶  Устанавливаю python3 и speedtest-cli …"
-        opkg update
-        opkg install python3 python3-pip || opkg install python3 python3
-        command -v pip3 >/dev/null 2>&1 || python3 -m ensurepip --upgrade
-        pip3 install --no-cache-dir speedtest-cli
-    fi
+  OPERA_BIN="$(command -v opera-proxy || true)"
+  [ -n "$OPERA_BIN" ] || { echo "ERROR: opera-proxy not found"; exit 1; }
 }
 
 get_regions() {
-    REGIONS=$("$OPERA_BIN" -list-countries 2>/dev/null | awk -F, 'NR>1{print $1}')
-    [ -n "$REGIONS" ] || REGIONS="EU AM AS"
+  REGIONS=$("$OPERA_BIN" -list-countries 2>/dev/null | awk -F, 'NR>1{print $1}')
+  [ -n "$REGIONS" ] || REGIONS="EU AM AS"
 }
 
-### ──────────────────────── запуск / остановка ────────────────────────
 kill_proxy()  { killall -q opera-proxy 2>/dev/null || true; sleep 1; }
 
-run_proxy_tmp() {             # $1 = регион
-    kill_proxy
-    "$OPERA_BIN" -country "$1" -listen 127.0.0.1:$PORT >/dev/null 2>&1 &
-    sleep 6
+run_proxy_tmp() {                            # $1 = region
+  kill_proxy
+  "$OPERA_BIN" -country "$1" -bind-address 127.0.0.1:$PORT >/dev/null 2>&1 &
+  sleep 6
 }
 
-### ──────────────────────── измерения ────────────────────────────────
-measure_region() {            # $1 = регион
-    region="$1"
-    printf "\n=== Тест %s ===\n" "$region"
-    run_proxy_tmp "$region"
-
-    SPEED=$(HTTP_PROXY=$PROXY_URL HTTPS_PROXY=$PROXY_URL \
-            speedtest-cli --simple 2>/dev/null || true)
-
-    PING_MS=$(echo "$SPEED" | awk '/Ping/{print $2}')
-    DL=$(echo "$SPEED"      | awk '/Download/{print $2}')
-    UL=$(echo "$SPEED"      | awk '/Upload/{print $2}')
-
-    [ -n "$PING_MS" ] || PING_MS=9999
-    [ -n "$DL" ]      || DL=0
-    [ -n "$UL" ]      || UL=0
-
-    echo "$region $PING_MS $DL $UL" | tee -a "$TMPDIR/results.txt"
+measure_region() {                           # $1 = region
+  r=$1; echo "=== Testing $r ==="
+  run_proxy_tmp "$r"
+  t=$( { time -p curl -s -o /dev/null -x "$PROXY_URL" "$TEST_URL"; } 2>&1 |
+       awk '/real/{print $2}' )
+  [ -n "$t" ] || { echo "$r 9999 0" | tee -a "$TMPDIR/results.txt"; return; }
+  dl=$(awk -v sz=$SIZE -v tt=$t 'BEGIN{printf "%.1f", (sz*8)/(tt*1000000)}')
+  echo "$r $t $dl" | tee -a "$TMPDIR/results.txt"
 }
 
-print_summary() {
-    printf "\n===== ИТОГ =====\n"
-    printf "%-4s %-8s %-8s %-8s\n" "Reg" "Ping" "DL" "UL"
-    sort -k3 -nr "$TMPDIR/results.txt" |
-    while read r p d u; do printf "%-4s %-8s %-8s %-8s\n" "$r" "$p" "$d" "$u"; done
-    BEST=$(sort -k3 -nr "$TMPDIR/results.txt" | head -n1 | awk '{print $1}')
-    printf "\n🚀  Лучший по скорости: %s\n" "$BEST"
+print_results() {
+  echo; echo "===== RESULTS ====="
+  printf "%-4s %-10s %-10s\n" Reg Time_s DL_Mbps
+  sort -k3 -nr "$TMPDIR/results.txt" |
+    while read r t d; do printf "%-4s %-10s %-10s\n" "$r" "$t" "$d"; done
+  BEST=$(sort -k3 -nr "$TMPDIR/results.txt" | head -n1 | awk '{print $1}')
+  echo; echo "Best region: $BEST"
 }
 
 choose_region() {
-    printf "\nВыберите регион (0 = лучший):\n"
+  echo; echo "Select region (0 = best):"
+  idx=1; for r in $REGIONS; do echo "[$idx] $r"; idx=$((idx+1)); done
+  echo "[0] $BEST (recommended)"; printf "> "
+  read -r CHOICE < /dev/tty
+  if [ "$CHOICE" = "0" ]; then CHOSEN=$BEST
+  else
     idx=1
-    for r in $REGIONS; do printf "[%d] %s\n" "$idx" "$r"; idx=$((idx+1)); done
-    printf "[0] %s (рекомендуется)\n> " "$BEST"
-    read -r CHOICE < /dev/tty
-    if [ "$CHOICE" = "0" ]; then CHOSEN="$BEST"
-    else
-        idx=1
-        for r in $REGIONS; do [ "$idx" = "$CHOICE" ] && CHOSEN="$r"; idx=$((idx+1)); done
-    fi
-    [ -n "$CHOSEN" ] || { echo "🚫  Неверный выбор."; exit 1; }
+    for r in $REGIONS; do [ "$idx" = "$CHOICE" ] && CHOSEN=$r; idx=$((idx+1)); done
+  fi
+  [ -n "$CHOSEN" ] || { echo "ERROR: invalid choice"; exit 1; }
 }
 
-### ──────────────────────── сохранение региона ───────────────────────
-patch_init() {                # $1 = регион
-    INIT=/etc/init.d/opera-proxy
-    grep -q -- '-country' "$INIT" \
-        &&  sed -i -E "s/-country [A-Z]{2}/-country $1/" "$INIT" \
-        ||  sed -i -E "s@(opera-proxy[^\n]*)@\1 -country $1@" "$INIT"
-    chmod +x "$INIT"
+patch_init() {                                # $1 = EU/AM/AS
+  INIT=/etc/init.d/opera-proxy
+  if grep -q 'procd_set_param[[:space:]]\+command[[:space:]]\+.*opera-proxy' "$INIT"; then
+    sed -i -E \
+      "s@(procd_set_param[[:space:]]+command[[:space:]]+[^ ]*opera-proxy)([^#]*)@\1 -country $1@" \
+      "$INIT"
+  elif grep -q '/opera-proxy' "$INIT"; then
+    sed -i -E "s@(/opera-proxy)([[:space:]]|\"|$)@\1 -country $1 @@" "$INIT"
+  else
+    echo "ERROR: cannot patch $INIT"; exit 1
+  fi
 }
 
 apply_region() {
-    echo "▶  Применяю регион $CHOSEN …"
-    patch_init "$CHOSEN"
-    /etc/init.d/opera-proxy enable
-    /etc/init.d/opera-proxy restart
+  echo "Applying region $CHOSEN ..."
+  patch_init "$CHOSEN"
+  /etc/init.d/opera-proxy enable
+  /etc/init.d/opera-proxy restart
+  sleep 5
 }
 
 verify_region() {
-    OUT=$(curl -s --proxy "$PROXY_URL" https://ipinfo.io/country || echo "?")
-    printf "🌍  Прокси выдал страну: %s\n" "$OUT"
-    echo "$OUT" | grep -qi "$CHOSEN" && echo "✅  Регион установлен." \
-                                         || echo "⚠️   Ожидали $CHOSEN"
+  country=$(curl -s --proxy "$PROXY_URL" https://ipinfo.io/country || echo "?")
+  echo "Proxy reports country: $country"
 }
 
-### ──────────────────────── main ─────────────────────────────────────
 main() {
-    need_root
-    check_opera
-    install_speedtest
-    get_regions
-    rm -f "$TMPDIR/results.txt"
+  need_root
+  check_opera
+  get_regions
+  rm -f "$TMPDIR/results.txt"
 
-    for r in $REGIONS; do measure_region "$r"; done
-    kill_proxy
-    print_summary
-    choose_region
-    apply_region
-    verify_region
-    echo "✔  Готово."
+  for r in $REGIONS; do measure_region "$r"; done
+  kill_proxy
+  print_results
+  choose_region
+  apply_region
+  verify_region
+  echo "Done."
 }
 
 main "$@"
