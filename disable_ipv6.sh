@@ -1,69 +1,108 @@
 #!/bin/sh
-echo "=== Начало процесса отключения IPv6 ==="
+# disable_ipv6_v2.1.sh — аккуратное и идемпотентное отключение IPv6 на OpenWrt (с ребутом)
 
-# Шаг 1. Отключение IPv6 на LAN и WAN
-echo "Шаг 1: Отключаем IPv6 на LAN и WAN..."
-uci set 'network.lan.ipv6=0'
-[ $? -eq 0 ] && echo "  LAN IPv6 отключен успешно" || { echo "  Ошибка: не удалось отключить LAN IPv6"; exit 1; }
-uci set 'network.wan.ipv6=0'
-[ $? -eq 0 ] && echo "  WAN IPv6 отключен успешно" || { echo "  Ошибка: не удалось отключить WAN IPv6"; exit 1; }
+set -eu
 
-# Шаг 2. Отключение DHCPv6 на LAN
-echo "Шаг 2: Отключаем DHCPv6 на LAN..."
-uci set 'dhcp.lan.dhcpv6=disabled'
-[ $? -eq 0 ] && echo "  DHCPv6 на LAN установлен в disabled" || { echo "  Ошибка: не удалось отключить DHCPv6 на LAN"; exit 1; }
-uci commit
-[ $? -eq 0 ] && echo "  Конфигурация сохранена" || { echo "  Ошибка: не удалось сохранить конфигурацию"; exit 1; }
+log() { echo "[IPv6-OFF] $*"; }
+ok()  { echo "  ✔ $*"; }
+warn(){ echo "  ! $*"; }
+die() { echo "  ✖ $*"; exit 1; }
 
-# Шаг 3. Удаляем параметры DHCPv6 и RA
-echo "Шаг 3: Удаляем настройки DHCPv6 и RA..."
-uci -q delete dhcp.lan.dhcpv6
-uci -q delete dhcp.lan.ra
-uci commit
-[ $? -eq 0 ] && echo "  Настройки DHCPv6 и RA удалены" || { echo "  Ошибка: не удалось удалить настройки DHCPv6 и RA"; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "Запусти от root"
 
-# Шаг 4. Отключение делегирования LAN
-echo "Шаг 4: Отключаем делегирование LAN..."
-uci set network.lan.delegate="0"
-uci commit
-[ $? -eq 0 ] && echo "  Делегирование LAN отключено" || { echo "  Ошибка: не удалось отключить делегирование LAN"; exit 1; }
+STAMP="$(date +%Y%m%d-%H%M%S)"
+# Бэкапы на всякий
+cp /etc/config/network "/etc/config/network.bak.$STAMP" 2>/dev/null || true
+cp /etc/config/dhcp     "/etc/config/dhcp.bak.$STAMP"     2>/dev/null || true
+cp /etc/config/firewall "/etc/config/firewall.bak.$STAMP" 2>/dev/null || true
 
-# Шаг 5. Удаление ULA префикса
-echo "Шаг 5: Удаляем ULA префикс..."
-uci -q delete network.globals.ula_prefix
-uci commit
-[ $? -eq 0 ] && echo "  ULA префикс удалён" || { echo "  Ошибка: не удалось удалить ULA префикс"; exit 1; }
+log "1) Отключаем IPv6/делегирование на всех интерфейсах, кроме loopback"
+IFACES="$(uci show network | sed -n "s/^network\.\([^.]*\)=interface.*/\1/p")"
+for ifc in $IFACES; do
+  [ "$ifc" = "loopback" ] && continue
+  uci set "network.$ifc.ipv6=0" || true
+  uci set "network.$ifc.delegate=0" || true
+done
+ok "ipv6=0 и delegate=0 поставлены глобально"
 
-# Шаг 6. Отключение и остановка odhcpd
-echo "Шаг 6: Отключаем и останавливаем odhcpd..."
-/etc/init.d/odhcpd disable
-/etc/init.d/odhcpd stop
-uci commit
-[ $? -eq 0 ] && echo "  odhcpd отключён и остановлен" || { echo "  Ошибка: не удалось отключить/остановить odhcpd"; exit 1; }
+log "2) Удаляем wan6 (dhcpv6), если есть"
+if uci -q show network.wan6 >/dev/null; then
+  uci -q delete network.wan6 || true
+  ok "network.wan6 удалён"
+else
+  warn "network.wan6 не найден — пропускаю"
+fi
 
-# Шаг 7. Перезапуск сети
-echo "Шаг 7: Перезапускаем сеть..."
+log "3) Режем DHCPv6/RA на всех DHCP-секциях (LAN/guest/iot/…)"
+DSECS="$(uci show dhcp | sed -n "s/^dhcp\.\([^.]*\)=dhcp.*/\1/p")"
+for s in $DSECS; do
+  uci -q delete "dhcp.$s.dhcpv6" || true
+  uci -q delete "dhcp.$s.ra"     || true
+done
+ok "DHCPv6 и RA удалены"
+
+log "4) Удаляем ULA-префикс (если был)"
+uci -q delete network.globals.ula_prefix || true
+ok "ULA префикс удалён"
+
+log "5) Отключаем и останавливаем odhcpd (RA/DHCPv6-сервер)"
+/etc/init.d/odhcpd stop    || true
+/etc/init.d/odhcpd disable || true
+ok "odhcpd отключён"
+
+log "6) Включаем фильтрацию AAAA во всех инстансах dnsmasq"
+DNSSECS="$(uci show dhcp | sed -n "s/^dhcp\.\([^.]*\)=dnsmasq.*/\1/p")"
+if [ -z "$DNSSECS" ]; then
+  # На всякий случай создадим одну секцию
+  uci add dhcp dnsmasq >/dev/null
+  DNSSECS="$(uci show dhcp | sed -n "s/^dhcp\.\([^.]*\)=dnsmasq.*/\1/p")"
+fi
+for s in $DNSSECS; do
+  uci set "dhcp.$s.filter_aaaa=1"
+done
+ok "dnsmasq настроен на выдачу только A-записей"
+
+log "7) Делаем sysctl персистентным и применяем его сейчас"
+mkdir -p /etc/sysctl.d
+SYSCTL_FILE="/etc/sysctl.d/99-disable-ipv6.conf"
+cat > "$SYSCTL_FILE" <<'EOF'
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+net.ipv6.conf.lo.disable_ipv6=1
+EOF
+# Применим немедленно (и на будущее загрузится сервисом sysctl)
+sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+ok "sysctl записан в $SYSCTL_FILE и применён"
+
+log "8) Коммитим и перезапускаем сервисы"
+uci commit network
+uci commit dhcp
 /etc/init.d/network restart
-[ $? -eq 0 ] && echo "  Сеть перезапущена успешно" || { echo "  Ошибка: не удалось перезапустить сеть"; exit 1; }
+/etc/init.d/dnsmasq restart
+/etc/init.d/firewall reload
+ok "network/dnsmasq/firewall обновлены"
 
-# Шаг 8. Отключение IPv6 через sysctl и /proc
-echo "Шаг 8: Отключаем IPv6 через sysctl и /proc..."
-sysctl -w net.ipv6.conf.all.disable_ipv6=1
-[ $? -eq 0 ] && echo "  IPv6 отключён на всех интерфейсах (sysctl)" || { echo "  Ошибка: не удалось отключить IPv6 (sysctl)"; exit 1; }
-echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-[ $? -eq 0 ] && echo "  /proc настроен для отключения IPv6" || { echo "  Ошибка: не удалось записать в /proc для отключения IPv6"; exit 1; }
-sysctl -w net.ipv6.conf.default.disable_ipv6=1
-[ $? -eq 0 ] && echo "  IPv6 отключён на интерфейсе по умолчанию" || { echo "  Ошибка: не удалось отключить IPv6 на интерфейсе по умолчанию"; exit 1; }
-sysctl -w net.ipv6.conf.lo.disable_ipv6=1
-[ $? -eq 0 ] && echo "  IPv6 отключён на loopback интерфейсе" || { echo "  Ошибка: не удалось отключить IPv6 на loopback интерфейсе"; exit 1; }
+# --- Опция: жёстко дропать IPv6 на firewall (раскомментируй блок ниже, если нужно) ---
+: <<'HARD_DROP_V6'
+log "9) (опционально) Добавляем правило firewall: DROP для всего IPv6"
+# Проверяем существование по имени правила (корректно для UCI)
+if uci show firewall | grep -q "name='block_ipv6_all'"; then
+  warn "правило block_ipv6_all уже есть — пропускаю"
+else
+  uci add firewall rule >/dev/null
+  uci set firewall.@rule[-1].name='block_ipv6_all'
+  uci set firewall.@rule[-1].family='ipv6'
+  uci set firewall.@rule[-1].src='*'
+  uci set firewall.@rule[-1].dest='*'
+  uci set firewall.@rule[-1].proto='all'
+  uci set firewall.@rule[-1].target='DROP'
+  uci commit firewall
+  /etc/init.d/firewall restart
+  ok "правило block_ipv6_all добавлено"
+fi
+HARD_DROP_V6
 
-# Шаг 9. Настройка dnsmasq для фильтрации AAAA записей
-echo "Шаг 9: Настраиваем dnsmasq на выдачу только IPv4 записей..."
-uci set dhcp.@dnsmasq[0].filter_aaaa='1'
-uci commit
-[ $? -eq 0 ] && echo "  dnsmasq настроен: выдача только IPv4 записей" || { echo "  Ошибка: не удалось настроить dnsmasq"; exit 1; }
-service dnsmasq restart
-[ $? -eq 0 ] && echo "  dnsmasq перезапущен" || { echo "  Ошибка: не удалось перезапустить dnsmasq"; exit 1; }
-
-echo "=== Все шаги выполнены успешно. Система перезагрузится. ==="
+log "Готово. IPv6 отключён системно, WAN6 удалён, AAAA отрезаны."
+log "Ребут через 2 секунды для полной идемпотентности..."
+sleep 2
 reboot
