@@ -14,47 +14,47 @@ die()  { echo "ОШИБКА: $*" >&2; exit 1; }
 need uci; need curl
 [ -x /etc/init.d/youtubeUnblock ] || die "youtubeUnblock не установлен (нет /etc/init.d/youtubeUnblock)"
 
-# ----- параметры теста (можно переопределять переменными окружения) -----
-RUNS="${YU_TEST_RUNS:-2}"          # повторы на стратегию (берём лучший)
-TIMEOUT="${YU_TEST_TIMEOUT:-20}"   # таймаут curl, сек
-DO_TR="${YU_TRACE:-1}"             # 1 = короткий traceroute (если установлен)
-SLEEP_RESTART="${YU_SLEEP:-1}"     # пауза после рестарта сервиса
-ANCHOR="${YU_ANCHOR:-google.com}"  # якорь для --connect-to (fallback на www.google.com)
-CURL_IPVER="${YU_IPVER:--4}"       # форсируем IPv4 по умолчанию
+# ----- параметры теста (переопределяются окружением при желании) -----
+RUNS="${YU_TEST_RUNS:-2}"            # повторы на стратегию (берём лучший)
+TIMEOUT="${YU_TEST_TIMEOUT:-20}"     # общий таймаут curl, сек
+CTO="${YU_CONNECT_TIMEOUT:-5}"       # connect-timeout, сек (чтобы не «висло»)
+DO_TR="${YU_TRACE:-1}"               # 1 = короткий traceroute (если установлен)
+SLEEP_RESTART="${YU_SLEEP:-1}"       # пауза после рестарта сервиса
+ANCHOR="${YU_ANCHOR:-google.com}"    # якорь для --connect-to; fallback на www.google.com
+CURL_IPVER="${YU_IPVER:--4}"         # жёстко IPv4 по умолчанию
 
 # Канонические URL из README (методика автора)
 TEST_YU="https://test.googlevideo.com/v2/cimg/android/blobs/sha256:6fd8bdac3da660bde7bd0b6f2b6a46e1b686afb74b9a4614def32532b73f5eaa"
 TEST_REF="https://mirror.gcr.io/v2/cimg/android/blobs/sha256:6fd8bdac3da660bde7bd0b6f2b6a46e1b686afb74b9a4614def32532b73f5eaa"
 
 curl_speed_one() {
-  # Возвращает speed_download (B/s) или 0 при ошибке.
-  # Порядок попыток:
-  #  1) IPv4 + --connect-to ::$ANCHOR:443
-  #  2) IPv4 + --connect-to ::www.google.com:443 (fallback)
-  #  3) IPv4 без --connect-to (прямо к mirror.gcr.io)
-  local url="$1"
-  local spd
+  # Возвращает speed_download (B/s) или 0. Следуем редиректам (-L), жёстко IPv4 (-4), явный порт :443.
+  # Порядок:
+  #  1) --connect-to ::$ANCHOR:443
+  #  2) --connect-to ::www.google.com:443
+  #  3) без --connect-to (прямо к mirror.gcr.io)
+  url="$1"
 
-  spd="$(curl $CURL_IPVER -m "$TIMEOUT" -skLo /dev/null \
-        --connect-to ::${ANCHOR}:443 -H 'Host: mirror.gcr.io' \
-        -w '%{speed_download}\n' "$url" 2>/dev/null || echo 0)"
+  spd="$(curl $CURL_IPVER -m "$TIMEOUT" --connect-timeout "$CTO" -skL -o /dev/null \
+         --connect-to ::${ANCHOR}:443 -H 'Host: mirror.gcr.io' \
+         -w '%{speed_download}\n' "$url" 2>/dev/null || echo 0)"
 
   case "$spd" in ''|0|*[!0-9.]*)
-    spd="$(curl $CURL_IPVER -m "$TIMEOUT" -skLo /dev/null \
-          --connect-to ::www.google.com:443 -H 'Host: mirror.gcr.io' \
-          -w '%{speed_download}\n' "$url" 2>/dev/null || echo 0)"
+    spd="$(curl $CURL_IPVER -m "$TIMEOUT" --connect-timeout "$CTO" -skL -o /dev/null \
+           --connect-to ::www.google.com:443 -H 'Host: mirror.gcr.io' \
+           -w '%{speed_download}\n' "$url" 2>/dev/null || echo 0)"
   esac
 
   case "$spd" in ''|0|*[!0-9.]*)
-    spd="$(curl $CURL_IPVER -m "$TIMEOUT" -skLo /dev/null \
-          -w '%{speed_download}\n' "$url" 2>/dev/null || echo 0)"
+    spd="$(curl $CURL_IPVER -m "$TIMEOUT" --connect-timeout "$CTO" -skL -o /dev/null \
+           -w '%{speed_download}\n' "$url" 2>/dev/null || echo 0)"
   esac
 
   echo "${spd:-0}"
 }
 
 curl_speed() {
-  # лучший (max) из RUNS замеров — устойчивей к случайным просадкам
+  # лучший (max) из RUNS замеров
   url="$1"; n="$RUNS"; best=0
   i=1
   while [ "$i" -le "$n" ]; do
@@ -108,12 +108,12 @@ SPD_REF="$(curl_speed "$TEST_REF")"
 SPD_BASE="$(curl_speed "$TEST_YU")"
 log "   Эталонная скорость (REF): ${SPD_REF} B/s"
 log "   Базовая скорость (без YU): ${SPD_BASE} B/s"
-case "$SPD_REF" in ''|0) die "Эталонный тест REF=0. Проверь сеть/DNS/маршрут до Google.";; esac
+case "$SPD_REF" in ''|0) die "Эталонный тест REF=0. Проверь маршрут до Google (в т.ч. провайдер/фаервол).";; esac
 
-# если без YU близко к эталону — блокировок нет
+# если без YU ≈ эталону — обход не нужен
 OK_REF="$(awk -v b="$SPD_BASE" -v r="$SPD_REF" 'BEGIN{ if(r>0 && b/r>=0.9) print 1; else print 0 }')"
 if [ "$OK_REF" = "1" ]; then
-  log "== Блокировок/троттлинга не видно (BASE ≈ REF). youtubeUnblock можно оставить по умолчанию."
+  log "== Блокировок не видно (BASE ≈ REF). youtubeUnblock можно оставить по умолчанию."
   exit 0
 fi
 
@@ -124,7 +124,7 @@ if [ "$DO_TR" = "1" ] && have traceroute; then
 fi
 
 # ----- 1) Кандидаты стратегий -----
-# threads=1 (рекомендация автора), QUIC — дроп: --udp-mode=drop --udp-filter-quic=parse
+# threads=1 (рекомендация автора), QUIC дропаем: --udp-mode=drop --udp-filter-quic=parse
 CAND="/tmp/yu_candidates.txt"
 cat >"$CAND" <<'EOF'
 base_md5_udrop|--syslog --threads=1 --udp-mode=drop --udp-filter-quic=parse --faking-strategy=md5sum --frag-sni-faked=1
@@ -203,8 +203,9 @@ esac
 # ----- 4) Итог: рейтинг и рекомендация (ничего не сохраняем) -----
 log ""
 log "== РЕЙТИНГ СТРАТЕГИЙ (по лучшему замеру, B/s) =="
+# BusyBox sort умеет -n -r; у нас в начале строки скорость — этого достаточно
 if have sort; then
-  sort -t'|' -k1,1nr "$RANK" | awk -F'|' '{printf "  - %s B/s  |  %s  |  %s\n",$1,$2,$3}'
+  sort -nr "$RANK" | awk -F'|' '{printf "  - %s B/s  |  %s  |  %s\n",$1,$2,$3}'
 else
   awk -F'|' '{printf "  - %s B/s  |  %s  |  %s\n",$1,$2,$3}' "$RANK"
 fi
