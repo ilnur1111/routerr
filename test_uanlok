@@ -1,0 +1,195 @@
+#!/bin/sh
+# youtubeUnblock — умный тестер стратегий (НЕ сохраняет конфиг)
+# Делает базовый замер без YU, перебор стратегий + локальный дотюнинг,
+# печатает рейтинг и рекомендуемые args. В конце все возвращает как было.
+
+set -eu
+
+# ---- предустановки / утилиты ----
+need() { command -v "$1" >/dev/null 2>&1 || { echo "ОШИБКА: нужен $1"; exit 1; }; }
+have() { command -v "$1" >/dev/null 2>&1; }
+log()  { printf '%s\n' "$*"; }
+die()  { echo "ОШИБКА: $*" >&2; exit 1; }
+
+need uci
+need curl
+
+# Проверим наличие сервиса
+[ -x /etc/init.d/youtubeUnblock ] || die "youtubeUnblock не установлен (нет init-скрипта)"
+
+# Тестовые URL из README (методика автора)
+TEST_YU="https://test.googlevideo.com/v2/cimg/android/blobs/sha256:6fd8bdac3da660bde7bd0b6f2b6a46e1b686afb74b9a4614def32532b73f5eaa"
+TEST_REF="https://mirror.gcr.io/v2/cimg/android/blobs/sha256:6fd8bdac3da660bde7bd0b6f2b6a46e1b686afb74b9a4614def32532b73f5eaa"
+
+curl_speed() {
+  # выводит speed_download (байт/с) или 0 при ошибке
+  curl -m 20 -skLo /dev/null --connect-to ::google.com -H 'Host: mirror.gcr.io' \
+    -w '%{speed_download}\n' "$1" 2>/dev/null || echo 0
+}
+
+# ---- сохраним исходный конфиг ----
+ORIG_STRAT="$(uci -q get youtubeUnblock.youtubeUnblock.conf_strat || echo '')"
+ORIG_ARGS="$(uci -q get youtubeUnblock.youtubeUnblock.args || echo '')"
+
+restore_cfg() {
+  if [ -n "$ORIG_STRAT" ]; then
+    uci set youtubeUnblock.youtubeUnblock.conf_strat="$ORIG_STRAT"
+  else
+    uci -q del youtubeUnblock.youtubeUnblock.conf_strat || true
+  fi
+  if [ -n "$ORIG_ARGS" ]; then
+    uci set youtubeUnblock.youtubeUnblock.args="$ORIG_ARGS"
+  else
+    uci -q del youtubeUnblock.youtubeUnblock.args || true
+  fi
+  uci commit youtubeUnblock
+  /etc/init.d/youtubeUnblock restart >/dev/null 2>&1 || true
+}
+
+apply_args() {
+  uci set youtubeUnblock.youtubeUnblock.conf_strat='args'
+  uci set youtubeUnblock.youtubeUnblock.args="$1"
+  uci commit youtubeUnblock
+  /etc/init.d/youtubeUnblock restart >/dev/null 2>&1 || return 1
+  sleep 1
+}
+
+cleanup() {
+  restore_cfg
+}
+trap cleanup EXIT INT TERM
+
+log "== youtubeUnblock: умный тест стратегий (ничего не сохраняю) =="
+
+# ---- 0) Базовая диагностика и замеры БЕЗ youtubeUnblock ----
+log "-- Останавливаю сервис для базового замера (без YU)…"
+/etc/init.d/youtubeUnblock stop >/dev/null 2>&1 || true
+sleep 1
+
+SPD_REF="$(curl_speed "$TEST_REF")"
+SPD_BASE="$(curl_speed "$TEST_YU")"
+
+log "   Эталонная скорость (REF): ${SPD_REF} B/s"
+log "   Базовая скорость (без YU): ${SPD_BASE} B/s"
+
+# sanity: если эталон 0 — сеть/ДНС? прекращаем
+case "$SPD_REF" in ''|0) die "Эталонный тест не прошел (REF=0). Проверь сеть/DNS.";; esac
+
+# если без YU и так ≥ 90% от эталона — троттлинга по SNI нет, дальше можно не мучить
+OK_REF="$(awk -v b="$SPD_BASE" -v r="$SPD_REF" 'BEGIN{ if(r>0 && b/r>=0.9) print 1; else print 0 }')"
+if [ "$OK_REF" = "1" ]; then
+  log "== Похоже, блокировки/троттлинга нет (BASE ≈ REF). YU можно оставить дефолтным."
+  exit 0
+fi
+
+# опциональная трассировка (если есть traceroute) — просто как подсказка
+if have traceroute; then
+  log "-- Короткий traceroute до googlevideo.com (подсказка, можно игнорировать)…"
+  traceroute -w 1 -m 6 googlevideo.com 2>/dev/null | sed 's/^/   /' || true
+fi
+
+# ---- 1) Набор кандидатов (разумные предустановки) ----
+# Замечания:
+#  * Всегда держим threads=1 (так рекомендует автор)
+#  * Пробуем с/без quic-drop (в YT QUIC часто мешает; флаг есть в README)
+#  * Играем faking-strategy: md5sum/tcp_check/pastseq/ttl (с TTL 8), плюс секция на googlevideo.com
+#  * Пробуем sni-detection=parse (дефолт) и brute на финальной фазе
+#  * Пробуем frag-sni-faked=0/1 на финишной доводке
+CAND_FILE="/tmp/yu_candidates.txt"
+cat >"$CAND_FILE" <<'EOF'
+base_md5_qd|--syslog --threads=1 --quic-drop --faking-strategy=md5sum --frag-sni-faked=1
+base_tcp_qd|--syslog --threads=1 --quic-drop --faking-strategy=tcp_check
+base_pst_qd|--syslog --threads=1 --quic-drop --faking-strategy=pastseq
+base_ttl8_qd|--syslog --threads=1 --quic-drop --faking-strategy=ttl --faking-ttl=8
+gv_md5_qd|--syslog --threads=1 --quic-drop --fbegin --sni-domains=googlevideo.com --faking-strategy=md5sum --frag-sni-faked=1 --fend
+base_md5|--syslog --threads=1 --faking-strategy=md5sum --frag-sni-faked=1
+EOF
+
+# ---- 2) Грубый перебор кандидатов ----
+BEST_NAME=""; BEST_ARGS=""; BEST_SPD=0
+
+log "-- Запускаю грубый перебор кандидатов…"
+while IFS='|' read -r NAME ARGS; do
+  [ -n "$NAME" ] || continue
+  log "   > $NAME"
+  if ! apply_args "$ARGS"; then
+    log "     ! не удалось применить профиль (пропускаю)"
+    continue
+  fi
+  SPD="$(curl_speed "$TEST_YU")"
+  log "     скорость: ${SPD} B/s"
+  awk_ok=1; case "$SPD" in ''|*[!0-9.]* ) awk_ok=0;; esac
+  if [ "$awk_ok" = 1 ]; then
+    is_better="$(awk -v a="$SPD" -v b="$BEST_SPD" 'BEGIN{ if(a>b) print 1; else print 0 }')"
+    [ "$is_better" = "1" ] && { BEST_NAME="$NAME"; BEST_ARGS="$ARGS"; BEST_SPD="$SPD"; }
+  fi
+done <"$CAND_FILE"
+
+# Если ничего не запустилось — выходим, возвращая исходные
+[ -n "$BEST_NAME" ] || die "Не удалось подобрать стратегию (все кандидаты провалились?)"
+
+log "-- Лучший по грубому перебору: $BEST_NAME (${BEST_SPD} B/s)"
+# если прирост незначительный — намекнуть, что YU мало помогает
+IMPR="$(awk -v b="$BEST_SPD" -v s="$SPD_BASE" 'BEGIN{ if(s>0) printf "%.2f", (b-s)/s; else print "inf" }')"
+log "   прирост к базе: ${IMPR}x"
+
+# ---- 3) Локальный «дотюнинг» победителя ----
+# a) попробуем brute vs parse
+TUNE_ARGS="$BEST_ARGS"
+for MODE in parse brute; do
+  ARGS_TRY="$(printf "%s %s" "$BEST_ARGS" "--sni-detection=$MODE")"
+  apply_args "$ARGS_TRY" || continue
+  SPD_TRY="$(curl_speed "$TEST_YU")"
+  log "   тюнинг sni-detection=$MODE -> ${SPD_TRY} B/s"
+  is_better="$(awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{ if(a>b) print 1; else print 0 }')"
+  [ "$is_better" = "1" ] && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$ARGS_TRY"; }
+done
+
+# b) если стратегия ttl — переберем TTL 4/8/12/16
+case "$TUNE_ARGS" in
+  *"--faking-strategy=ttl"*)
+    for T in 4 8 12 16; do
+      ARGS_TRY="$(echo "$TUNE_ARGS" | sed -E 's/--faking-ttl=[0-9]+//g') --faking-ttl='"$T"
+      apply_args "$ARGS_TRY" || continue
+      SPD_TRY="$(curl_speed "$TEST_YU")"
+      log "   тюнинг TTL=$T -> ${SPD_TRY} B/s"
+      is_better="$(awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{ if(a>b) print 1; else print 0 }')"
+      [ "$is_better" = "1" ] && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$ARGS_TRY"; }
+    done
+  ;;
+esac
+
+# c) попробуем flip для --frag-sni-faked (0/1), если ключ отсутствовал — протестим обе версии
+case "$TUNE_ARGS" in *"--frag-sni-faked="* ) : ;; *)
+  for F in 0 1; do
+    ARGS_TRY="$TUNE_ARGS --frag-sni-faked=$F"
+    apply_args "$ARGS_TRY" || continue
+    SPD_TRY="$(curl_speed "$TEST_YU")"
+    log "   тюнинг frag-sni-faked=$F -> ${SPD_TRY} B/s"
+    is_better="$(awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{ if(a>b) print 1; else print 0 }')"
+    [ "$is_better" = "1" ] && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$ARGS_TRY"; }
+  done
+esac
+
+# d) финальный прогон с/без quic-drop (если не было явного указания) — может дать + на живом трафике
+case "$TUNE_ARGS" in
+  *"--quic-drop"*) : ;;
+  *)
+    for Q in with without; do
+      if [ "$Q" = "with" ]; then ARGS_TRY="$TUNE_ARGS --quic-drop"; else ARGS_TRY="$TUNE_ARGS"; fi
+      apply_args "$ARGS_TRY" || continue
+      SPD_TRY="$(curl_speed "$TEST_YU")"
+      log "   тюнинг quic-drop($Q) -> ${SPD_TRY} B/s"
+      is_better="$(awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{ if(a>b) print 1; else print 0 }')"
+      [ "$is_better" = "1" ] && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$ARGS_TRY"; }
+    done
+  ;;
+esac
+
+# ---- 4) Итог и восстановление исходной конфигурации ----
+log "== ИТОГ: рекомендованные args (НЕ сохранены) =="
+echo "$TUNE_ARGS"
+log "   Ожидаемая скорость (по тесту): ${BEST_SPD} B/с"
+log "   Для применения: uci set youtubeUnblock.youtubeUnblock.conf_strat='args'; uci set youtubeUnblock.youtubeUnblock.args='$(printf "%s" "$TUNE_ARGS" | sed "s/'/'\\\\''/g")'; uci commit youtubeUnblock; /etc/init.d/youtubeUnblock restart"
+
+exit 0
