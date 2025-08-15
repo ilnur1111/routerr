@@ -1,6 +1,6 @@
 #!/bin/sh
 # youtubeUnblock — умный тест стратегий (НЕ сохраняет конфиг)
-# Фокус: стабильная стратегия для 4K. Перебор + тюнинг + ре-валидация.
+# Фокус: стабильная 4K-стратегия. Перебор + тюнинг + re-check лучших.
 set -eu
 
 # ===== ПАРАМЕТРЫ (env) =====
@@ -84,7 +84,7 @@ agg(){
       else awk 'END{print 0}'; fi ;;
     p90)
       if have sort; then
-        sort -n | awk 'NF{a[NR]=$1} END{ if(NR==0){print 0;exit} idx=int(0.9*(NR-1))+1; print a[idx] }'
+        sort -n | awk 'NF{a[NR]=$1} END{ if(NR==0){print 0;exit} idx=int(0.9*(NR-1))+1; if(idx<1)idx=1; print a[idx] }'
       else awk 'END{print 0}'; fi ;;
     max|*) awk 'BEGIN{m=0} {if($1>m)m=$1} END{print m}';;
   esac
@@ -200,28 +200,37 @@ for MODE in parse brute; do
   fi
 done
 
-# (b) TTL sweep 1..10 + альтернатива ttl
+# (b) TTL sweep 1..10 + альтернатива ttl (корректная ПОДМЕНА стратегии)
 test_ttl_strategy(){
   base="$1"
   for T in $TTL_RANGE; do
     TRY="$(printf "%s" "$base" | sed -E 's/--faking-ttl=[0-9]+//g') --faking-ttl=$T"
+    TRY="$(norm_args "$TRY")"
     if apply_args "$TRY"; then
       SPD_TRY="$(measure "$TEST_YU")"
       log "   TTL=$T -> ${SPD_TRY} B/s"
-      echo "$SPD_TRY|tune_ttl=$T|$(norm_args "$TRY")" >>"$RANK"
-      awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$(norm_args "$TRY")"; } || true
+      echo "$SPD_TRY|tune_ttl=$T|$TRY" >>"$RANK"
+      awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$TRY"; } || true
     fi
   done
 }
-case "$TUNE_ARGS" in *"--faking-strategy=ttl"*) test_ttl_strategy "$TUNE_ARGS" ;;
-  *) ALT="$(printf "%s" "$TUNE_ARGS" | sed -E 's/--faking-strategy=[^ ]+//g; s/--faking-ttl=[0-9]+//g') --faking-strategy=ttl --faking-ttl=5"
-     if apply_args "$ALT"; then
-       SPD_ALT="$(measure "$TEST_YU")"
-       log "   alt ttl start -> ${SPD_ALT} B/s"
-       echo "$SPD_ALT|alt_ttl_start|$(norm_args "$ALT")" >>"$RANK"
-       awk -v a="$SPD_ALT" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_ALT"; TUNE_ARGS="$(norm_args "$ALT")"; } || true
-       test_ttl_strategy "$TUNE_ARGS --faking-strategy=ttl"
-     fi ;;
+case "$TUNE_ARGS" in
+  *"--faking-strategy=ttl"*)
+    BASE_TTL="$(printf "%s" "$TUNE_ARGS" | sed -E 's/--faking-ttl=[0-9]+//g')"
+    test_ttl_strategy "$BASE_TTL"
+    ;;
+  *)
+    ALT="$(printf "%s" "$TUNE_ARGS" | sed -E 's/--faking-strategy=[^ ]+//g; s/--faking-ttl=[0-9]+//g') --faking-strategy=ttl --faking-ttl=5"
+    ALT="$(norm_args "$ALT")"
+    if apply_args "$ALT"; then
+      SPD_ALT="$(measure "$TEST_YU")"
+      log "   alt ttl start -> ${SPD_ALT} B/s"
+      echo "$SPD_ALT|alt_ttl_start|$ALT" >>"$RANK"
+      awk -v a="$SPD_ALT" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_ALT"; TUNE_ARGS="$ALT"; } || true
+      BASE_TTL="$(printf "%s" "$ALT" | sed -E 's/--faking-ttl=[0-9]+//g')"
+      test_ttl_strategy "$BASE_TTL"
+    fi
+    ;;
 esac
 
 # (c) frag-sni-faked toggle
@@ -237,14 +246,15 @@ case "$TUNE_ARGS" in *"--frag-sni-faked="* ) : ;; * )
   done
 esac
 
-# (d) UDP drop toggle
+# (d1) UDP drop toggle
 case "$TUNE_ARGS" in *"--udp-mode=drop"*)
   TRY="$(printf "%s" "$TUNE_ARGS" | sed -E 's/--udp-mode=drop//g; s/--udp-filter-quic=[^ ]+//g')"
+  TRY="$(norm_args "$TRY")"
   if apply_args "$TRY"; then
     SPD_TRY="$(measure "$TEST_YU")"
     log "   udp-drop=without -> ${SPD_TRY} B/s"
-    echo "$SPD_TRY|tune_udp=without|$(norm_args "$TRY")" >>"$RANK"
-    awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$(norm_args "$TRY")"; } || true
+    echo "$SPD_TRY|tune_udp=without|$TRY" >>"$RANK"
+    awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$TRY"; } || true
   fi
   ;;
   *)
@@ -257,18 +267,24 @@ case "$TUNE_ARGS" in *"--udp-mode=drop"*)
   fi
   ;;
 esac
-# (d2) udp-filter-quic parse|brute
+
+# (d2) udp-filter-quic parse|brute (только если включён udp-drop)
 for UF in parse brute; do
-  case "$TUNE_ARGS" in *"--udp-mode=drop"*)
-    TRY="$(printf "%s" "$TUNE_ARGS" | sed -E 's/--udp-filter-quic=[^ ]+//g') --udp-filter-quic=$UF"
-    TRY="$(norm_args "$TRY")"
-    if apply_args "$TRY"; then
-      SPD_TRY="$(measure "$TEST_YU")"
-      log "   udp-filter-quic=$UF -> ${SPD_TRY} B/s"
-      echo "$SPD_TRY|tune_udpfilter=$UF|$TRY" >>"$RANK"
-      awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$TRY"; } || true
-    fi
-  fi
+  case "$TUNE_ARGS" in
+    *"--udp-mode=drop"*)
+      TRY="$(printf "%s" "$TUNE_ARGS" | sed -E 's/--udp-filter-quic=[^ ]+//g') --udp-filter-quic=$UF"
+      TRY="$(norm_args "$TRY")"
+      if apply_args "$TRY"; then
+        SPD_TRY="$(measure "$TEST_YU")"
+        log "   udp-filter-quic=$UF -> ${SPD_TRY} B/s"
+        echo "$SPD_TRY|tune_udpfilter=$UF|$TRY" >>"$RANK"
+        awk -v a="$SPD_TRY" -v b="$BEST_SPD" 'BEGIN{exit !(a>b)}' && { BEST_SPD="$SPD_TRY"; TUNE_ARGS="$TRY"; } || true
+      fi
+      ;;
+    *)
+      : # udp-drop выключен — пропускаем
+      ;;
+  esac
 done
 
 # (e) threads sweep
@@ -283,7 +299,7 @@ for TH in $THREADS_LIST; do
   fi
 done
 
-# ===== 3) Повторная валидация Top-N (без bash-процесса) =====
+# ===== 3) Повторная валидация Top-N =====
 if have sort; then
   log "-- Повторная валидация лучших $RECHECK_TOP…"
   sort -nr "$RANK" | head -n "$RECHECK_TOP" | while IFS='|' read -r _ _ ARGS; do
@@ -310,10 +326,10 @@ log "Ожидаемая скорость: ${BEST_SPD} B/s"
 MBIT="$(awk -v b="$BEST_SPD" 'BEGIN{if(b>0) printf("%.2f", b*8/1000000); else print "0.00"}')"
 log "Ожидаемая скорость: ~${MBIT} Мбит/с"
 
-# Информативно: тянет ли 4K?
-FOURK30_OK="$(awk -v m="$MBIT" 'BEGIN{exit !(m>=35)}')"; FOURK60_OK="$(awk -v m="$MBIT" 'BEGIN{exit !(m>=55)}')"
-[ -z "$FOURK30_OK" ] && log "✔ 4K30 должно быть стабильно" || log "⚠ 4K30 на грани — попробуй YU_TEST_RUNS=4..6"
-[ -z "$FOURK60_OK" ] && log "✔ 4K60 должно быть стабильно" || log "⚠ 4K60 может дропать — посмотри лидеров в рейтинге"
+FOURK30_OK="$(awk -v m="$MBIT" 'BEGIN{if(m>=35) print 1; else print 0}')"
+FOURK60_OK="$(awk -v m="$MBIT" 'BEGIN{if(m>=55) print 1; else print 0}')"
+[ "$FOURK30_OK" = "1" ] && log "✔ 4K30 должно быть стабильно" || log "⚠ 4K30 на грани — попробуй YU_TEST_RUNS=4..6 или AGG=p90"
+[ "$FOURK60_OK" = "1" ] && log "✔ 4K60 должно быть стабильно" || log "⚠ 4K60 может дропать — смотри лидеров рейтинга"
 
 log ""
 log "Чтобы применить (вручную):"
