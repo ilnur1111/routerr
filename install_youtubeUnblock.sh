@@ -1,14 +1,9 @@
 #!/bin/sh
 # Установщик youtubeUnblock 1.1.0 для OpenWrt (fw4/nft)
 # Проверено на: Cudy TR3000 (Filogic, aarch64_cortex-a53)
-# Особенности:
-#  - Без проверки версии OpenWrt (работает на 24.10.2 и др., если есть fw4/nft)
-#  - Автопоиск правильных .ipk по странице релиза v1.1.0
-#  - Русские сообщения и комментарии
 
 set -eu
 
-# ---------- утилиты ----------
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 fetch() { # fetch <url> <out>
@@ -19,7 +14,6 @@ fetch() { # fetch <url> <out>
 }
 log() { printf '%s\n' "$*"; }
 
-# ---------- окружение ----------
 FW=iptables; have fw4 && FW=nft
 [ "$FW" = "nft" ] || die "Обнаружен iptables. Этот установщик рассчитан на fw4/nft."
 
@@ -30,7 +24,7 @@ VER="1.1.0"
 BASE_ASSETS="https://github.com/Waujito/youtubeUnblock/releases/expanded_assets/v${VER}"
 BASE_DOWNLOAD="https://github.com/Waujito/youtubeUnblock/releases/download/v${VER}"
 
-# Список возможных «серий» OpenWrt в имени пакета (сначала актуальная)
+# Список возможных «серий» OpenWrt (сначала актуальная из системы)
 SERIES_CAND=""
 if [ -r /etc/openwrt_release ]; then
   . /etc/openwrt_release
@@ -49,15 +43,15 @@ umask 022
 log "=== Установка youtubeUnblock ${VER} (fw4/nft) ==="
 log "[детектировано] arch: ${ARCH} ; firewall: ${FW}"
 
-# ---------- [0] opkg update ----------
+# [0] opkg update
 log "[0] Обновляю список пакетов (opkg update)…"
 opkg update >/dev/null || die "opkg update завершился с ошибкой"
 
-# ---------- [1] kmod'ы для nft ----------
+# [1] kmod'ы для nft
 log "[1] Устанавливаю модули ядра: kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack"
 opkg install kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack >/dev/null || die "Не удалось установить kmod-пакеты"
 
-# ---------- [2] получаем список артефактов релиза ----------
+# [2] получаем список артефактов релиза
 log "[2] Получаю список артефактов релиза ${VER}…"
 fetch "$BASE_ASSETS" "$ASSETS_HTML" || die "Не удалось получить список артефактов релиза"
 
@@ -73,7 +67,7 @@ for S in $SERIES_CAND; do
 done
 [ -n "$PKG_YU" ] || die "Не найден пакет youtubeUnblock для arch=${ARCH} среди серий: ${SERIES_CAND}. Проверь релиз."
 
-# ---------- [3] скачиваем .ipk ----------
+# [3] скачиваем .ipk
 cd "$TMPDIR" || die "Не удалось перейти в /tmp"
 YU_URL="${BASE_DOWNLOAD}/${PKG_YU}"
 LUCI_URL="${BASE_DOWNLOAD}/${PKG_LUCI}"
@@ -83,7 +77,7 @@ fetch "$YU_URL"   "$PKG_YU"   || die "Не удалось скачать ${YU_UR
 fetch "$LUCI_URL" "$PKG_LUCI" || die "Не удалось скачать ${LUCI_URL}"
 [ -s "$PKG_YU" ] && [ -s "$PKG_LUCI" ] || die "Скачанные файлы пусты"
 
-# ---------- [4] (опционально) проверка SHA256 ----------
+# [4] (опционально) проверка SHA256
 VERIFY="${YU_VERIFY_SHA:-0}"
 if [ "$VERIFY" = "1" ]; then
   have sha256sum || die "Нет sha256sum для проверки"
@@ -96,13 +90,17 @@ else
   log "[4] Проверка SHA256 пропущена (установить YU_VERIFY_SHA=1 для включения)"
 fi
 
-# ---------- [5] установка .ipk ----------
+# [5] установка .ipk
 log "[5] Устанавливаю пакеты…"
 opkg install "./${PKG_YU}" "./${PKG_LUCI}" >/dev/null || die "opkg install завершился с ошибкой"
 [ -x /etc/init.d/youtubeUnblock ] || die "После установки не найден /etc/init.d/youtubeUnblock"
-have nft || die "Команда 'nft' не найдена — необходим пакет nftables"
 
-# ---------- [6] гарантируем include для fw4 ----------
+# гарантируем наличие 'nft' (если нет — попробуем доставить пакет nftables)
+if ! have nft; then
+  opkg install nftables >/dev/null 2>&1 || die "Команда 'nft' недоступна и пакет nftables установить не удалось"
+fi
+
+# [6] гарантируем include для fw4
 log "[6] Проверяю include nft: ${INC}"
 if [ ! -f "$INC" ]; then
   mkdir -p "$(dirname "$INC")" || die "Не удалось создать каталог для include"
@@ -117,7 +115,7 @@ else
   log "  (=) include уже существует: $INC"
 fi
 
-# ---------- [7] перезагрузка firewall и сервисов ----------
+# [7] перезагрузка firewall и сервисов
 log "[7] Перезагружаю firewall (fw4)…"
 /etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || die "Не удалось перезагрузить fw4"
 have modprobe && { modprobe nfnetlink_queue 2>/dev/null || true; modprobe nft_queue 2>/dev/null || true; }
@@ -126,7 +124,7 @@ log "[8] Включаю автозапуск и перезапускаю youtube
 /etc/init.d/youtubeUnblock enable >/dev/null || die "Не удалось включить автозапуск"
 /etc/init.d/youtubeUnblock restart >/dev/null || die "Не удалось перезапустить сервис"
 
-# ---------- [9] быстрые проверки ----------
+# [9] быстрые проверки
 log "[9] Проверки…"
 if nft -a list chain inet fw4 youtubeUnblock >/dev/null 2>&1; then
   log "  OK: цепочка 'inet fw4 youtubeUnblock' присутствует в nft"
