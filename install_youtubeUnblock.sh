@@ -1,76 +1,145 @@
 #!/bin/sh
-echo "=== Начало установки youtubeUnblock и luci-app-youtubeUnblock ==="
+# Установщик youtubeUnblock 1.1.0 для OpenWrt (fw4/nft)
+# Проверено на: Cudy TR3000 (Filogic, aarch64_cortex-a53)
+# Особенности:
+#  - НЕТ проверки версии OpenWrt (подходит для 24.10.2 и др., если fw4/nft)
+#  - Автопоиск правильных .ipk по странице релиза v1.1.0 (без жёсткого хэша)
+#  - Поддержка curl/wget/uclient-fetch
 
-# Шаг 0. Обновление списка пакетов
-echo "Обновляем список пакетов..."
-opkg update
-[ $? -eq 0 ] && echo "  Список пакетов обновлен" || { echo "  Ошибка обновления списка пакетов"; exit 1; }
+set -eu
 
-# Шаг 1. Установка модулей для nftables
-echo "Устанавливаем модули kmod-nft-queue и kmod-nfnetlink-queue..."
-opkg install kmod-nft-queue kmod-nfnetlink-queue
-[ $? -eq 0 ] && echo "  Модули установлены" || { echo "  Ошибка установки модулей"; exit 1; }
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+die() { echo "ОШИБКА: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+fetch() { # fetch <url> <out>
+  if have curl; then curl -fL --retry 3 -o "$2" "$1";
+  elif have wget; then wget -q -O "$2" "$1";
+  elif have uclient-fetch; then uclient-fetch -q -O "$2" "$1";
+  else die "Нужен curl или wget (или uclient-fetch)"; fi
+}
+log() { printf '%s\n' "$*"; }
 
-echo "Проверяем установку kmod-nft..."
-opkg list-installed | grep kmod-nft
-[ $? -eq 0 ] && echo "  Пакеты kmod-nft обнаружены" || { echo "  Пакеты kmod-nft не найдены"; exit 1; }
+# ---------- ОПРЕДЕЛЕНИЕ ОКРУЖЕНИЯ ----------
+FW=iptables; have fw4 && FW=nft
+[ "$FW" = "nft" ] || die "Обнаружен iptables. Этот установщик рассчитан на fw4/nft."
 
-echo "Загружаем модули nfnetlink_queue и nft_queue..."
-modprobe nfnetlink_queue
-[ $? -eq 0 ] && echo "  Модуль nfnetlink_queue загружен" || { echo "  Ошибка загрузки nfnetlink_queue"; exit 1; }
-modprobe nft_queue
-[ $? -eq 0 ] && echo "  Модуль nft_queue загружен" || { echo "  Ошибка загрузки nft_queue"; exit 1; }
+ARCH="$(opkg print-architecture | awk '/^arch / && $2 !~ /(all|noarch)/{print $2; exit}')"
+[ -n "$ARCH" ] || die "Не удалось определить архитектуру opkg"
 
-# Шаг 2. Переходим в /tmp
-echo "Переходим в каталог /tmp..."
-cd /tmp || { echo "  Ошибка: не удалось перейти в /tmp"; exit 1; }
+VER="1.1.0"
+BASE_ASSETS="https://github.com/Waujito/youtubeUnblock/releases/expanded_assets/v${VER}"
+BASE_DOWNLOAD="https://github.com/Waujito/youtubeUnblock/releases/download/v${VER}"
 
-# Шаг 3. Скачивание youtubeUnblock IPK
-echo "Скачиваем пакет youtubeUnblock..."
-wget https://github.com/Waujito/youtubeUnblock/releases/download/v1.0.0/youtubeUnblock-1.0.0-10-f37c3dd-aarch64_cortex-a53-openwrt-23.05.ipk
-[ $? -eq 0 ] && echo "  Пакет youtubeUnblock скачан" || { echo "  Ошибка скачивания youtubeUnblock"; exit 1; }
+# Подготовим список возможных «серий» OpenWrt в имени пакета (сначала актуальная для системы)
+SERIES_CAND=""
+if [ -r /etc/openwrt_release ]; then
+  . /etc/openwrt_release
+  if [ -n "${DISTRIB_RELEASE:-}" ]; then
+    SR="openwrt-$(echo "$DISTRIB_RELEASE" | cut -d. -f1,2)"
+    SERIES_CAND="$SR"
+  fi
+fi
+# Добавим типовые варианты (дубликаты не страшны)
+SERIES_CAND="${SERIES_CAND} openwrt-24.10 openwrt-23.05"
 
-echo "Просмотр содержимого /tmp:"
-ls -lh /tmp
+INC="/usr/share/nftables.d/ruleset-post/537-youtubeUnblock.nft"
+TMPDIR="/tmp"
+ASSETS_HTML="${TMPDIR}/yu_assets_${VER}.html"
+umask 022
 
-# Шаг 4. Переименование youtubeUnblock
-echo "Переименовываем скачанный файл youtubeUnblock..."
-mv /tmp/f819f1ad-5f84-4888-9102-3a2ee54ce469* /tmp/youtubeUnblock-1.0.0-10-f37c3dd-aarch64_cortex-a53-openwrt-23.05.ipk
-[ $? -eq 0 ] && echo "  Файл переименован успешно" || { echo "  Ошибка переименования файла youtubeUnblock"; exit 1; }
+log "=== Установка youtubeUnblock ${VER} (fw4/nft) ==="
+log "[детектировано] arch: ${ARCH} ; firewall: ${FW}"
 
-# Шаг 5. Установка youtubeUnblock
-echo "Устанавливаем youtubeUnblock..."
-opkg install /tmp/youtubeUnblock-1.0.0-10-f37c3dd-aarch64_cortex-a53-openwrt-23.05.ipk
-[ $? -eq 0 ] && echo "  youtubeUnblock установлен успешно" || { echo "  Ошибка установки youtubeUnblock"; exit 1; }
+# ---------- ШАГ 0: opkg update ----------
+log "[0] Обновляю список пакетов (opkg update)…"
+opkg update >/dev/null || die "opkg update завершился с ошибкой"
 
-echo "Проверяем установку youtubeUnblock..."
-opkg list-installed | grep youtubeUnblock
-[ $? -eq 0 ] && echo "  youtubeUnblock обнаружен в системе" || { echo "  youtubeUnblock не обнаружен"; exit 1; }
+# ---------- ШАГ 1: ставим необходимые kmod'ы ----------
+log "[1] Устанавливаю модули ядра: kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack"
+opkg install kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack >/dev/null || die "Не удалось установить kmod-пакеты"
 
-# Шаг 6. Включение автозапуска youtubeUnblock
-echo "Включаем автозапуск youtubeUnblock..."
-/etc/init.d/youtubeUnblock enable
-[ $? -eq 0 ] && echo "  youtubeUnblock настроен на автозапуск" || { echo "  Ошибка включения автозапуска youtubeUnblock"; exit 1; }
+# ---------- ШАГ 2: получаем список артефактов релиза и подбираем имена .ipk ----------
+log "[2] Получаю список артефактов релиза ${VER}…"
+fetch "$BASE_ASSETS" "$ASSETS_HTML" || die "Не удалось получить список артефактов релиза"
 
-# Блок перезагрузки системы удален
-# Если требуется, можно добавить инструкцию о том, что перезагрузка должна выполняться вручную.
+# Найдём имя luci-пакета (он без архитектуры и серии)
+PKG_LUCI="$(sed -n "s#.*download/v${VER}/\\(luci-app-youtubeUnblock-[^\"']*\\.ipk\\).*#\\1#p" "$ASSETS_HTML" | head -n1 || true)"
+[ -n "$PKG_LUCI" ] || die "Не найден luci-app пакет в релизе v${VER}"
 
-# Шаг 7. Скачивание luci-app-youtubeUnblock
-echo "Скачиваем пакет luci-app-youtubeUnblock..."
-wget https://github.com/Waujito/youtubeUnblock/releases/download/v1.0.0/luci-app-youtubeUnblock-1.0.0-10-f37c3dd.ipk
-[ $? -eq 0 ] && echo "  Пакет luci-app-youtubeUnblock скачан" || { echo "  Ошибка скачивания luci-app-youtubeUnblock"; exit 1; }
+# Подбираем имя основного пакета под нашу архитектуру/серию
+PKG_YU=""
+for S in $SERIES_CAND; do
+  CAND="$(sed -n "s#.*download/v${VER}/\\(youtubeUnblock-[^\"']*-${ARCH}-${S}\\.ipk\\).*#\\1#p" "$ASSETS_HTML" | head -n1 || true)"
+  if [ -n "$CAND" ]; then PKG_YU="$CAND"; log "  Найден пакет под систему: ${PKG_YU}"; break; fi
+done
+[ -n "$PKG_YU" ] || die "Не найден пакет youtubeUnblock для arch=${ARCH} среди серий: ${SERIES_CAND}. Проверь релиз."
 
-echo "Просмотр содержимого /tmp:"
-ls -lh /tmp
+# ---------- ШАГ 3: скачиваем .ipk ----------
+cd "$TMPDIR" || die "Не удалось перейти в /tmp"
+YU_URL="${BASE_DOWNLOAD}/${PKG_YU}"
+LUCI_URL="${BASE_DOWNLOAD}/${PKG_LUCI}"
 
-# Шаг 8. Переименование luci-app-youtubeUnblock
-echo "Переименовываем скачанный файл luci-app-youtubeUnblock..."
-mv /tmp/0335bf23-4502-4637-ab76-0c9471a48f68* /tmp/luci-app-youtubeUnblock-1.0.0-10-f37c3dd.ipk
-[ $? -eq 0 ] && echo "  Файл переименован успешно" || { echo "  Ошибка переименования файла luci-app-youtubeUnblock"; exit 1; }
+log "[3] Скачиваю пакеты из релиза ${VER}…"
+fetch "$YU_URL"   "$PKG_YU"   || die "Не удалось скачать ${YU_URL}"
+fetch "$LUCI_URL" "$PKG_LUCI" || die "Не удалось скачать ${LUCI_URL}"
+[ -s "$PKG_YU" ] && [ -s "$PKG_LUCI" ] || die "Скачанные файлы пусты"
 
-# Шаг 9. Установка luci-app-youtubeUnblock
-echo "Устанавливаем luci-app-youtubeUnblock..."
-opkg install /tmp/luci-app-youtubeUnblock-1.0.0-10-f37c3dd.ipk
-[ $? -eq 0 ] && echo "  luci-app-youtubeUnblock установлен успешно" || { echo "  Ошибка установки luci-app-youtubeUnblock"; exit 1; }
+# (Опционально) Жёсткая проверка SHA256:
+#   включается переменной окружения: YU_VERIFY_SHA=1
+#   хэши можно передать через YU_SHA256 / LUCI_SHA256
+VERIFY="${YU_VERIFY_SHA:-0}"
+if [ "$VERIFY" = "1" ]; then
+  have sha256sum || die "Нет sha256sum для проверки"
+  [ -n "${YU_SHA256:-}" ]   || die "YU_SHA256 не задан"
+  [ -n "${LUCI_SHA256:-}" ] || die "LUCI_SHA256 не задан"
+  echo "${YU_SHA256}  ${PKG_YU}"    | sha256sum -c - || die "SHA256 не совпал для ${PKG_YU}"
+  echo "${LUCI_SHA256}  ${PKG_LUCI}"| sha256sum -c - || die "SHA256 не совпал для ${PKG_LUCI}"
+  log "[4] SHA256 проверены"
+else
+  log "[4] Проверка SHA256 пропущена (установить YU_VERIFY_SHA=1 для включения)"
+fi
 
-echo "=== Установка завершена успешно ==="
+# ---------- ШАГ 5: установка .ipk ----------
+log "[5] Устанавливаю пакеты…"
+opkg install "./${PKG_YU}" "./${PKG_LUCI}" >/dev/null || die "opkg install завершился с ошибкой"
+[ -x /etc/init.d/youtubeUnblock ] || die "После установки не найден /etc/init.d/youtubeUnblock"
+
+# ---------- ШАГ 6: гарантируем include для fw4 ----------
+log "[6] Проверяю include nft: ${INC}"
+if [ ! -f "$INC" ]; then
+  mkdir -p "$(dirname "$INC")" || die "Не удалось создать каталог для include"
+  cat >"$INC" <<'EOF'
+add chain inet fw4 youtubeUnblock { type filter hook postrouting priority mangle - 1; policy accept; }
+add rule  inet fw4 youtubeUnblock 'tcp dport 443 ct original packets < 20 counter queue num 537 bypass'
+add rule  inet fw4 youtubeUnblock 'meta l4proto udp ct original packets < 9 counter queue num 537 bypass'
+insert rule inet fw4 output 'mark and 0x8000 == 0x8000 counter accept'
+EOF
+  log "  (+) include создан: $INC"
+else
+  log "  (=) include уже существует: $INC"
+fi
+
+# ---------- ШАГ 7: перезагружаем firewall и активируем сервис ----------
+log "[7] Перезагружаю firewall (fw4)…"
+/etc/init.d/firewall reload >/dev/null || /etc/init.d/firewall restart >/dev/null || die "Не удалось перезагрузить fw4"
+have modprobe && { modprobe nfnetlink_queue 2>/dev/null || true; modprobe nft_queue 2>/dev/null || true; }
+
+log "[8] Включаю автозапуск и перезапускаю youtubeUnblock…"
+/etc/init.d/youtubeUnblock enable >/dev/null || die "Не удалось включить автозапуск"
+ /etc/init.d/youtubeUnblock restart >/dev/null || die "Не удалось перезапустить сервис"
+
+# ---------- ШАГ 9: быстрые проверки ----------
+log "[9] Проверки…"
+if nft -a list chain inet fw4 youtubeUnblock >/dev/null 2>&1; then
+  log "  OK: цепочка 'inet fw4 youtubeUnblock' присутствует в nft"
+else
+  die "Цепочка 'youtubeUnblock' не найдена в nft"
+fi
+
+if logread -l 200 | grep -iq youtubeunblock; then
+  log "  OK: в системном логе есть записи youtubeUnblock"
+else
+  log "  ПРИМЕЧАНИЕ: логов пока может не быть — это нормально сразу после установки"
+fi
+
+log "=== Готово. При необходимости: /etc/init.d/firewall reload && /etc/init.d/youtubeUnblock restart ==="
