@@ -2,13 +2,13 @@
 # Установщик youtubeUnblock 1.1.0 для OpenWrt (fw4/nft)
 # Проверено на: Cudy TR3000 (Filogic, aarch64_cortex-a53)
 # Особенности:
-#  - НЕТ проверки версии OpenWrt (подходит для 24.10.2 и др., если fw4/nft)
-#  - Автопоиск правильных .ipk по странице релиза v1.1.0 (без жёсткого хэша)
-#  - Поддержка curl/wget/uclient-fetch
+#  - Без проверки версии OpenWrt (работает на 24.10.2 и др., если есть fw4/nft)
+#  - Автопоиск правильных .ipk по странице релиза v1.1.0
+#  - Русские сообщения и комментарии
 
 set -eu
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+# ---------- утилиты ----------
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 fetch() { # fetch <url> <out>
@@ -19,7 +19,7 @@ fetch() { # fetch <url> <out>
 }
 log() { printf '%s\n' "$*"; }
 
-# ---------- ОПРЕДЕЛЕНИЕ ОКРУЖЕНИЯ ----------
+# ---------- окружение ----------
 FW=iptables; have fw4 && FW=nft
 [ "$FW" = "nft" ] || die "Обнаружен iptables. Этот установщик рассчитан на fw4/nft."
 
@@ -30,7 +30,7 @@ VER="1.1.0"
 BASE_ASSETS="https://github.com/Waujito/youtubeUnblock/releases/expanded_assets/v${VER}"
 BASE_DOWNLOAD="https://github.com/Waujito/youtubeUnblock/releases/download/v${VER}"
 
-# Подготовим список возможных «серий» OpenWrt в имени пакета (сначала актуальная для системы)
+# Список возможных «серий» OpenWrt в имени пакета (сначала актуальная)
 SERIES_CAND=""
 if [ -r /etc/openwrt_release ]; then
   . /etc/openwrt_release
@@ -39,7 +39,6 @@ if [ -r /etc/openwrt_release ]; then
     SERIES_CAND="$SR"
   fi
 fi
-# Добавим типовые варианты (дубликаты не страшны)
 SERIES_CAND="${SERIES_CAND} openwrt-24.10 openwrt-23.05"
 
 INC="/usr/share/nftables.d/ruleset-post/537-youtubeUnblock.nft"
@@ -50,23 +49,23 @@ umask 022
 log "=== Установка youtubeUnblock ${VER} (fw4/nft) ==="
 log "[детектировано] arch: ${ARCH} ; firewall: ${FW}"
 
-# ---------- ШАГ 0: opkg update ----------
+# ---------- [0] opkg update ----------
 log "[0] Обновляю список пакетов (opkg update)…"
 opkg update >/dev/null || die "opkg update завершился с ошибкой"
 
-# ---------- ШАГ 1: ставим необходимые kmod'ы ----------
+# ---------- [1] kmod'ы для nft ----------
 log "[1] Устанавливаю модули ядра: kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack"
 opkg install kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack >/dev/null || die "Не удалось установить kmod-пакеты"
 
-# ---------- ШАГ 2: получаем список артефактов релиза и подбираем имена .ipk ----------
+# ---------- [2] получаем список артефактов релиза ----------
 log "[2] Получаю список артефактов релиза ${VER}…"
 fetch "$BASE_ASSETS" "$ASSETS_HTML" || die "Не удалось получить список артефактов релиза"
 
-# Найдём имя luci-пакета (он без архитектуры и серии)
+# luci-пакет (обычно noarch)
 PKG_LUCI="$(sed -n "s#.*download/v${VER}/\\(luci-app-youtubeUnblock-[^\"']*\\.ipk\\).*#\\1#p" "$ASSETS_HTML" | head -n1 || true)"
 [ -n "$PKG_LUCI" ] || die "Не найден luci-app пакет в релизе v${VER}"
 
-# Подбираем имя основного пакета под нашу архитектуру/серию
+# основной пакет под нашу архитектуру/серию
 PKG_YU=""
 for S in $SERIES_CAND; do
   CAND="$(sed -n "s#.*download/v${VER}/\\(youtubeUnblock-[^\"']*-${ARCH}-${S}\\.ipk\\).*#\\1#p" "$ASSETS_HTML" | head -n1 || true)"
@@ -74,7 +73,7 @@ for S in $SERIES_CAND; do
 done
 [ -n "$PKG_YU" ] || die "Не найден пакет youtubeUnblock для arch=${ARCH} среди серий: ${SERIES_CAND}. Проверь релиз."
 
-# ---------- ШАГ 3: скачиваем .ipk ----------
+# ---------- [3] скачиваем .ipk ----------
 cd "$TMPDIR" || die "Не удалось перейти в /tmp"
 YU_URL="${BASE_DOWNLOAD}/${PKG_YU}"
 LUCI_URL="${BASE_DOWNLOAD}/${PKG_LUCI}"
@@ -84,9 +83,7 @@ fetch "$YU_URL"   "$PKG_YU"   || die "Не удалось скачать ${YU_UR
 fetch "$LUCI_URL" "$PKG_LUCI" || die "Не удалось скачать ${LUCI_URL}"
 [ -s "$PKG_YU" ] && [ -s "$PKG_LUCI" ] || die "Скачанные файлы пусты"
 
-# (Опционально) Жёсткая проверка SHA256:
-#   включается переменной окружения: YU_VERIFY_SHA=1
-#   хэши можно передать через YU_SHA256 / LUCI_SHA256
+# ---------- [4] (опционально) проверка SHA256 ----------
 VERIFY="${YU_VERIFY_SHA:-0}"
 if [ "$VERIFY" = "1" ]; then
   have sha256sum || die "Нет sha256sum для проверки"
@@ -99,12 +96,13 @@ else
   log "[4] Проверка SHA256 пропущена (установить YU_VERIFY_SHA=1 для включения)"
 fi
 
-# ---------- ШАГ 5: установка .ipk ----------
+# ---------- [5] установка .ipk ----------
 log "[5] Устанавливаю пакеты…"
 opkg install "./${PKG_YU}" "./${PKG_LUCI}" >/dev/null || die "opkg install завершился с ошибкой"
 [ -x /etc/init.d/youtubeUnblock ] || die "После установки не найден /etc/init.d/youtubeUnblock"
+have nft || die "Команда 'nft' не найдена — необходим пакет nftables"
 
-# ---------- ШАГ 6: гарантируем include для fw4 ----------
+# ---------- [6] гарантируем include для fw4 ----------
 log "[6] Проверяю include nft: ${INC}"
 if [ ! -f "$INC" ]; then
   mkdir -p "$(dirname "$INC")" || die "Не удалось создать каталог для include"
@@ -119,16 +117,16 @@ else
   log "  (=) include уже существует: $INC"
 fi
 
-# ---------- ШАГ 7: перезагружаем firewall и активируем сервис ----------
+# ---------- [7] перезагрузка firewall и сервисов ----------
 log "[7] Перезагружаю firewall (fw4)…"
-/etc/init.d/firewall reload >/dev/null || /etc/init.d/firewall restart >/dev/null || die "Не удалось перезагрузить fw4"
+/etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || die "Не удалось перезагрузить fw4"
 have modprobe && { modprobe nfnetlink_queue 2>/dev/null || true; modprobe nft_queue 2>/dev/null || true; }
 
 log "[8] Включаю автозапуск и перезапускаю youtubeUnblock…"
 /etc/init.d/youtubeUnblock enable >/dev/null || die "Не удалось включить автозапуск"
- /etc/init.d/youtubeUnblock restart >/dev/null || die "Не удалось перезапустить сервис"
+/etc/init.d/youtubeUnblock restart >/dev/null || die "Не удалось перезапустить сервис"
 
-# ---------- ШАГ 9: быстрые проверки ----------
+# ---------- [9] быстрые проверки ----------
 log "[9] Проверки…"
 if nft -a list chain inet fw4 youtubeUnblock >/dev/null 2>&1; then
   log "  OK: цепочка 'inet fw4 youtubeUnblock' присутствует в nft"
