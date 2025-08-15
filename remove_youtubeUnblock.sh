@@ -1,52 +1,101 @@
 #!/bin/sh
-echo "=== Начало удаления youtubeUnblock и luci-app-youtubeUnblock ==="
+# Удаление youtubeUnblock и связанного окружения на OpenWrt (fw4/nft)
+# Безопасно для повторных запусков. Сообщения — на русском.
+# Опции окружения:
+#   REMOVE_KMODS=1     — попытаться удалить kmod-nft-queue, kmod-nfnetlink-queue, kmod-nf-conntrack
+#   FIX_MINIUPNPD=1    — починить include miniupnpd под fw4 (убрать legacy-поля)
 
-# Шаг 1. Остановка сервиса youtubeUnblock
-echo "Шаг 1: Останавливаем службу youtubeUnblock..."
-if /etc/init.d/youtubeUnblock stop 2>/dev/null; then
-    echo "  youtubeUnblock остановлен успешно"
+set -eu
+
+die() { echo "ОШИБКА: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+log() { printf '%s\n' "$*"; }
+
+FW=iptables; have fw4 && FW=nft
+INC="/usr/share/nftables.d/ruleset-post/537-youtubeUnblock.nft"
+
+log "=== Начало удаления youtubeUnblock ==="
+log "[детектировано] firewall: $FW"
+
+# 1) Остановить сервис и выключить автозапуск (если есть init-скрипт)
+if [ -x /etc/init.d/youtubeUnblock ]; then
+  log "Шаг 1: Останавливаю службу youtubeUnblock…"
+  /etc/init.d/youtubeUnblock stop >/dev/null 2>&1 || true
+  log "Шаг 2: Отключаю автозапуск youtubeUnblock…"
+  /etc/init.d/youtubeUnblock disable >/dev/null 2>&1 || true
 else
-    echo "  youtubeUnblock не запущен или отсутствует"
+  log "Примечание: init-скрипт youtubeUnblock не найден — пропускаю остановку/disable"
 fi
 
-# Шаг 2. Отключение автозапуска youtubeUnblock
-echo "Шаг 2: Отключаем автозапуск youtubeUnblock..."
-if /etc/init.d/youtubeUnblock disable 2>/dev/null; then
-    echo "  Автозапуск youtubeUnblock отключён"
+# 2) Снять runtime-правила nft и удалить include
+if [ "$FW" = "nft" ] && have nft; then
+  log "Шаг 3: Удаляю runtime-правила nft (если есть)…"
+  # Удалить правило из output (по сигнатуре mark 0x8000) — можем найти и удалить по handle
+  HANDLE_IDS="$(nft -a list chain inet fw4 output 2>/dev/null | awk '/mark and 0x8000 == 0x8000/ {gsub(/;$/,"",$NF); print $NF}')"
+  if [ -n "$HANDLE_IDS" ]; then
+    for h in $HANDLE_IDS; do nft delete rule inet fw4 output handle "$h" 2>/dev/null || true; done
+  fi
+  # Стереть и удалить цепочку youtubeUnblock, если существует
+  if nft list chain inet fw4 youtubeUnblock >/dev/null 2>&1; then
+    nft flush chain inet fw4 youtubeUnblock 2>/dev/null || true
+    nft delete chain inet fw4 youtubeUnblock 2>/dev/null || true
+  fi
+
+  log "Шаг 4: Удаляю include-файл правил (если есть)…"
+  if [ -f "$INC" ]; then
+    rm -f "$INC" || die "Не удалось удалить $INC"
+  fi
+
+  log "Шаг 5: Перезагружаю firewall (fw4)…"
+  /etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
 else
-    echo "  youtubeUnblock не найден или автозапуск уже отключён"
+  log "Примечание: fw4/nft не обнаружен или команда 'nft' недоступна — пропускаю снятие правил"
 fi
 
-# Шаг 3. Удаление пакета youtubeUnblock
-echo "Шаг 3: Удаляем пакет youtubeUnblock..."
-opkg remove youtubeUnblock
-if [ $? -eq 0 ]; then
-    echo "  youtubeUnblock успешно удалён"
-else
-    echo "  Ошибка удаления youtubeUnblock или пакет отсутствует"
+# 3) Удалить пакеты (LuCI — это веб-интерфейс, у него нет init.d сервиса)
+log "Шаг 6: Удаляю пакеты…"
+opkg remove luci-app-youtubeUnblock >/dev/null 2>&1 || log "  Примечание: luci-app-youtubeUnblock уже отсутствует"
+opkg remove youtubeUnblock          >/dev/null 2>&1 || log "  Примечание: youtubeUnblock уже отсутствует"
+
+# 4) (опционально) удалить kmod’ы
+if [ "${REMOVE_KMODS:-0}" = "1" ]; then
+  log "Шаг 7 (необязательно): Пытаюсь удалить kmod-пакеты…"
+  opkg remove kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack >/dev/null 2>&1 || \
+    log "  Примечание: kmod-пакеты заняты зависимостями или уже удалены"
 fi
 
-# Шаг 4. Остановка и отключение luci-app-youtubeUnblock
-echo "Шаг 4: Останавливаем и отключаем автозапуск luci-app-youtubeUnblock..."
-if /etc/init.d/luci-app-youtubeUnblock stop 2>/dev/null; then
-    echo "  luci-app-youtubeUnblock остановлен успешно"
-else
-    echo "  luci-app-youtubeUnblock не запущен или отсутствует"
+# 5) (опционально) починка miniupnpd include под fw4
+if [ "${FIX_MINIUPNPD:-0}" = "1" ] && have uci; then
+  log "Шаг 8 (необязательно): Исправляю include miniupnpd под fw4…"
+  uci -q set firewall.miniupnpd=include
+  uci -q set firewall.miniupnpd.type='script'
+  uci -q set firewall.miniupnpd.path='/usr/share/miniupnpd/firewall.include'
+  uci -q del firewall.miniupnpd.family || true
+  uci -q del firewall.miniupnpd.reload || true
+  uci commit firewall
+  /etc/init.d/firewall reload >/dev/null 2>&1 || true
 fi
 
-if /etc/init.d/luci-app-youtubeUnblock disable 2>/dev/null; then
-    echo "  Автозапуск luci-app-youtubeUnblock отключён"
-else
-    echo "  luci-app-youtubeUnblock не найден или автозапуск уже отключён"
+# 6) Быстрые проверки
+log "Шаг 9: Проверки…"
+if [ "$FW" = "nft" ] && have nft; then
+  if nft list chain inet fw4 youtubeUnblock >/dev/null 2>&1; then
+    log "  ВНИМАНИЕ: цепочка 'inet fw4 youtubeUnblock' всё ещё существует"
+  else
+    log "  OK: цепочка 'inet fw4 youtubeUnblock' отсутствует"
+  fi
 fi
 
-# Шаг 5. Удаление пакета luci-app-youtubeUnblock
-echo "Шаг 5: Удаляем пакет luci-app-youtubeUnblock..."
-opkg remove luci-app-youtubeUnblock
-if [ $? -eq 0 ]; then
-    echo "  luci-app-youtubeUnblock успешно удалён"
+if opkg list-installed | grep -q '^youtubeUnblock'; then
+  log "  ВНИМАНИЕ: пакет youtubeUnblock всё ещё установлен"
 else
-    echo "  Ошибка удаления luci-app-youtubeUnblock или пакет отсутствует"
+  log "  OK: пакет youtubeUnblock удалён"
 fi
 
-echo "=== Удаление завершено успешно ==="
+if opkg list-installed | grep -q '^luci-app-youtubeUnblock'; then
+  log "  ВНИМАНИЕ: пакет luci-app-youtubeUnblock всё ещё установлен"
+else
+  log "  OK: пакет luci-app-youtubeUnblock удалён"
+fi
+
+log "=== Удаление завершено ==="
