@@ -1,19 +1,50 @@
 #!/bin/sh
 # disable_ipv6_v2.3.sh — аккуратное и идемпотентное отключение IPv6 на OpenWrt (с ребутом)
 
+# Гарантируем наличие /sbin и /usr/sbin при запуске через "curl ... | sh"
+PATH="/sbin:/usr/sbin:/bin:/usr/bin:${PATH:-}"
+
 set -eu
 
-log() { echo "[IPv6-OFF] $*"; }
-ok()  { echo "  ✔ $*"; }
-warn(){ echo "  ! $*"; }
-die() { echo "  ✖ $*"; exit 1; }
+log()  { echo "[IPv6-OFF] $*"; }
+ok()   { echo "  ✔ $*"; }
+warn() { echo "  ! $*"; }
+die()  { echo "  ✖ $*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Использование: disable_ipv6.sh [--no-reboot] [--no-backup] [--help]
+
+--no-reboot    Не выполнять автоматический ребут (можно также SKIP_REBOOT=1)
+--no-backup    Пропустить создание бэкапов /etc/config/{network,dhcp} (SKIP_BACKUP=1)
+-h, --help     Показать эту справку
+EOF
+}
 
 [ "$(id -u)" -eq 0 ] || die "Запусти от root"
+[ -x "$(command -v uci 2>/dev/null)" ] || die "uci не найден в PATH — это точно OpenWrt?"
+
+SKIP_REBOOT="${SKIP_REBOOT:-0}"
+SKIP_BACKUP="${SKIP_BACKUP:-0}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-reboot) SKIP_REBOOT=1 ;;
+    --no-backup) SKIP_BACKUP=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Неизвестный флаг: $1" ;;
+  esac
+  shift
+done
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-# Бэкапы на всякий (фаервол не трогаем — бэкап не делаем)
-cp /etc/config/network "/etc/config/network.bak.$STAMP" 2>/dev/null || true
-cp /etc/config/dhcp     "/etc/config/dhcp.bak.$STAMP"     2>/dev/null || true
+if [ "$SKIP_BACKUP" = "1" ]; then
+  warn "Бэкапы пропущены (SKIP_BACKUP=1 или --no-backup)"
+else
+  log "Создаём бэкапы /etc/config/network и /etc/config/dhcp"
+  cp /etc/config/network "/etc/config/network.bak.$STAMP" 2>/dev/null || true
+  cp /etc/config/dhcp     "/etc/config/dhcp.bak.$STAMP"     2>/dev/null || true
+fi
 
 log "1) Отключаем IPv6/делегирование на всех интерфейсах, кроме loopback; чистим ip6assign/ip6hint"
 IFACES="$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)=interface.*/\1/p" || true)"
@@ -77,14 +108,22 @@ log "8) Коммитим и перезапускаем сервисы"
 uci commit network
 uci commit dhcp
 /etc/init.d/network restart
-if [ -x /etc/init.d/dnsmasq ] && uci -q show dhcp | grep -q "=dnsmasq"; then
-  /etc/init.d/dnsmasq restart
-  ok "dnsmasq перезапущен"
+if [ -x /etc/init.d/dnsmasq ]; then
+  if uci -q show dhcp 2>/dev/null | grep -q "=dnsmasq"; then
+    /etc/init.d/dnsmasq restart
+    ok "dnsmasq перезапущен"
+  else
+    warn "секций dnsmasq не найдено — перезапуск пропущен"
+  fi
 else
-  warn "dnsmasq не обнаружен или не сконфигурирован — перезапуск пропущен"
+  warn "dnsmasq не обнаружен — перезапуск пропущен"
 fi
 
 log "Готово. IPv6 отключён системно, wan6 удалён, AAAA отрезаны (если dnsmasq используется)."
-log "Ребут через 2 секунды для полной идемпотентности..."
-sleep 2
-reboot
+if [ "$SKIP_REBOOT" = "1" ]; then
+  warn "Ребут пропущен (SKIP_REBOOT=1 или --no-reboot) — перезапусти вручную при необходимости"
+else
+  log "Ребут через 2 секунды для полной идемпотентности..."
+  sleep 2
+  reboot
+fi
