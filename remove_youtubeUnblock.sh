@@ -11,8 +11,26 @@ die() { echo "ОШИБКА: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 log() { printf '%s\n' "$*"; }
 
-FW=iptables; have fw4 && FW=nft
+FW=iptables
+have fw4 && FW=nft
+
 INC="/usr/share/nftables.d/ruleset-post/537-youtubeUnblock.nft"
+
+# Считываем mark/queue_num из UCI до того, как, возможно, удалим конфиг
+YT_MARK_HEX="0x8000"
+YT_QNUM="537"
+
+if have uci; then
+  M="$(uci -q get youtubeUnblock.youtubeUnblock.packet_mark || echo '')"
+  Q="$(uci -q get youtubeUnblock.youtubeUnblock.queue_num || echo '')"
+
+  if [ -n "$M" ]; then
+    # packet_mark в UCI обычно в десятичном виде
+    YT_MARK_HEX="$(printf '0x%X' "$M" 2>/dev/null || echo '0x8000')"
+  fi
+
+  [ -n "$Q" ] && YT_QNUM="$Q"
+fi
 
 log "=== Начало удаления youtubeUnblock ==="
 log "[детектировано] firewall: $FW"
@@ -27,14 +45,39 @@ else
   log "Примечание: init-скрипт youtubeUnblock не найден — пропускаю остановку/disable"
 fi
 
+# 1.1) Чистим UCI-конфиг
+if have uci; then
+  if uci -q show youtubeUnblock >/dev/null 2>&1; then
+    log "Шаг 2a: Удаляю UCI-конфиг youtubeUnblock…"
+    uci -q delete youtubeUnblock || true
+    uci commit youtubeUnblock >/dev/null 2>&1 || true
+  else
+    log "Примечание: UCI-конфиг youtubeUnblock уже отсутствует"
+  fi
+fi
+
+# На всякий случай добиваем сам файл, если он остался пустым
+[ -f /etc/config/youtubeUnblock ] && rm -f /etc/config/youtubeUnblock || true
+
 # 2) Снять runtime-правила nft и удалить include
 if [ "$FW" = "nft" ] && have nft; then
   log "Шаг 3: Удаляю runtime-правила nft (если есть)…"
-  # Удалить правило из output (по сигнатуре mark 0x8000) — можем найти и удалить по handle
-  HANDLE_IDS="$(nft -a list chain inet fw4 output 2>/dev/null | awk '/mark and 0x8000 == 0x8000/ {gsub(/;$/,"",$NF); print $NF}')"
-  if [ -n "$HANDLE_IDS" ]; then
-    for h in $HANDLE_IDS; do nft delete rule inet fw4 output handle "$h" 2>/dev/null || true; done
+
+  # Ищем правила в output, которые принимают пакеты с нашим mark/очередью
+  HANDLE_IDS="$(nft -a list chain inet fw4 output 2>/dev/null | \
+    awk -v m="$YT_MARK_HEX" -v q="$YT_QNUM" '
+      /mark and/ || /queue num/ {
+        if ((m != "" && index($0, m)) || (q != "" && index($0, "queue num " q))) {
+          gsub(/;$/,"",$NF); print $NF
+        }
+      }')"
+
+  if [ -n "${HANDLE_IDS:-}" ]; then
+    for h in $HANDLE_IDS; do
+      nft delete rule inet fw4 output handle "$h" 2>/dev/null || true
+    done
   fi
+
   # Стереть и удалить цепочку youtubeUnblock, если существует
   if nft list chain inet fw4 youtubeUnblock >/dev/null 2>&1; then
     nft flush chain inet fw4 youtubeUnblock 2>/dev/null || true
@@ -56,6 +99,18 @@ fi
 log "Шаг 6: Удаляю пакеты…"
 opkg remove luci-app-youtubeUnblock >/dev/null 2>&1 || log "  Примечание: luci-app-youtubeUnblock уже отсутствует"
 opkg remove youtubeUnblock          >/dev/null 2>&1 || log "  Примечание: youtubeUnblock уже отсутствует"
+
+# 3.1) Добиваем возможные хвосты от init-скрипта
+if [ ! -e /usr/bin/youtubeUnblock ] && [ -f /etc/init.d/youtubeUnblock ]; then
+  log "Шаг 6a: Удаляю оставшийся init-скрипт /etc/init.d/youtubeUnblock…"
+  rm -f /etc/init.d/youtubeUnblock || true
+fi
+
+# symlink'и в /etc/rc.d
+for f in /etc/rc.d/*youtubeUnblock*; do
+  [ -e "$f" ] || continue
+  rm -f "$f" || true
+done
 
 # 4) (опционально) удалить kmod’ы
 if [ "${REMOVE_KMODS:-0}" = "1" ]; then
@@ -96,6 +151,12 @@ if opkg list-installed | grep -q '^luci-app-youtubeUnblock'; then
   log "  ВНИМАНИЕ: пакет luci-app-youtubeUnblock всё ещё установлен"
 else
   log "  OK: пакет luci-app-youtubeUnblock удалён"
+fi
+
+if [ -f /etc/config/youtubeUnblock ]; then
+  log "  ВНИМАНИЕ: /etc/config/youtubeUnblock всё ещё существует"
+else
+  log "  OK: конфиг /etc/config/youtubeUnblock удалён"
 fi
 
 log "=== Удаление завершено ==="
