@@ -7,17 +7,23 @@ set -eu
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 fetch() { # fetch <url> <out>
-  if have curl; then curl -fL --retry 3 -o "$2" "$1";
-  elif have wget; then wget -q -O "$2" "$1";
-  elif have uclient-fetch; then uclient-fetch -q -O "$2" "$1";
-  else die "Нужен curl или wget (или uclient-fetch)"; fi
+  if have curl; then
+    curl -fL --retry 3 -o "$2" "$1"
+  elif have wget; then
+    wget -q -O "$2" "$1"
+  elif have uclient-fetch; then
+    uclient-fetch -q -O "$2" "$1"
+  else
+    die "Нужен curl или wget (или uclient-fetch)"
+  fi
 }
 log() { printf '%s\n' "$*"; }
 
-FW=iptables; have fw4 && FW=nft
+FW=iptables
+have fw4 && FW=nft
 [ "$FW" = "nft" ] || die "Обнаружен iptables. Этот установщик рассчитан на fw4/nft."
 
-ARCH="$(opkg print-architecture | awk '/^arch / && $2 !~ /(all|noarch)/{print $2; exit}')"
+ARCH="$(opkg print-architecture | awk '/^arch / && $2 !~ /(all|noarch)/ { print $2; exit }')"
 [ -n "$ARCH" ] || die "Не удалось определить архитектуру opkg"
 
 VER="1.1.0"
@@ -49,7 +55,8 @@ opkg update >/dev/null || die "opkg update завершился с ошибко�
 
 # [1] kmod'ы для nft
 log "[1] Устанавливаю модули ядра: kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack"
-opkg install kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack >/dev/null || die "Не удалось установить kmod-пакеты"
+opkg install kmod-nfnetlink-queue kmod-nft-queue kmod-nf-conntrack >/dev/null \
+  || die "Не удалось установить kmod-пакеты"
 
 # [2] получаем список артефактов релиза
 log "[2] Получаю список артефактов релиза ${VER}…"
@@ -63,7 +70,11 @@ PKG_LUCI="$(sed -n "s#.*download/v${VER}/\\(luci-app-youtubeUnblock-[^\"']*\\.ip
 PKG_YU=""
 for S in $SERIES_CAND; do
   CAND="$(sed -n "s#.*download/v${VER}/\\(youtubeUnblock-[^\"']*-${ARCH}-${S}\\.ipk\\).*#\\1#p" "$ASSETS_HTML" | head -n1 || true)"
-  if [ -n "$CAND" ]; then PKG_YU="$CAND"; log "  Найден пакет под систему: ${PKG_YU}"; break; fi
+  if [ -n "$CAND" ]; then
+    PKG_YU="$CAND"
+    log "  Найден пакет под систему: ${PKG_YU}"
+    break
+  fi
 done
 [ -n "$PKG_YU" ] || die "Не найден пакет youtubeUnblock для arch=${ARCH} среди серий: ${SERIES_CAND}. Проверь релиз."
 
@@ -83,8 +94,8 @@ if [ "$VERIFY" = "1" ]; then
   have sha256sum || die "Нет sha256sum для проверки"
   [ -n "${YU_SHA256:-}" ]   || die "YU_SHA256 не задан"
   [ -n "${LUCI_SHA256:-}" ] || die "LUCI_SHA256 не задан"
-  echo "${YU_SHA256}  ${PKG_YU}"    | sha256sum -c - || die "SHA256 не совпал для ${PKG_YU}"
-  echo "${LUCI_SHA256}  ${PKG_LUCI}"| sha256sum -c - || die "SHA256 не совпал для ${PKG_LUCI}"
+  echo "${YU_SHA256}  ${PKG_YU}"     | sha256sum -c - || die "SHA256 не совпал для ${PKG_YU}"
+  echo "${LUCI_SHA256}  ${PKG_LUCI}" | sha256sum -c - || die "SHA256 не совпал для ${PKG_LUCI}"
   log "[4] SHA256 проверены"
 else
   log "[4] Проверка SHA256 пропущена (установить YU_VERIFY_SHA=1 для включения)"
@@ -106,9 +117,9 @@ if [ ! -f "$INC" ]; then
   mkdir -p "$(dirname "$INC")" || die "Не удалось создать каталог для include"
   cat >"$INC" <<'EOF'
 add chain inet fw4 youtubeUnblock { type filter hook postrouting priority mangle - 1; policy accept; }
-add rule  inet fw4 youtubeUnblock 'tcp dport 443 ct original packets < 20 counter queue num 537 bypass'
-add rule  inet fw4 youtubeUnblock 'meta l4proto udp ct original packets < 9 counter queue num 537 bypass'
-insert rule inet fw4 output 'mark and 0x8000 == 0x8000 counter accept'
+add rule inet fw4 youtubeUnblock tcp dport 443 ct original packets < 20 counter queue num 537 bypass
+add rule inet fw4 youtubeUnblock meta l4proto udp ct original packets < 9 counter queue num 537 bypass
+insert rule inet fw4 output mark and 0x8000 == 0x8000 counter accept
 EOF
   log "  (+) include создан: $INC"
 else
@@ -117,11 +128,17 @@ fi
 
 # [7] перезагрузка firewall и сервисов
 log "[7] Перезагружаю firewall (fw4)…"
-/etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || die "Не удалось перезагрузить fw4"
-have modprobe && { modprobe nfnetlink_queue 2>/dev/null || true; modprobe nft_queue 2>/dev/null || true; }
+/etc/init.d/firewall reload >/dev/null 2>&1 \
+  || /etc/init.d/firewall restart >/dev/null 2>&1 \
+  || die "Не удалось перезагрузить fw4"
+
+have modprobe && {
+  modprobe nfnetlink_queue 2>/dev/null || true
+  modprobe nft_queue        2>/dev/null || true
+}
 
 log "[8] Включаю автозапуск и перезапускаю youtubeUnblock…"
-/etc/init.d/youtubeUnblock enable >/dev/null || die "Не удалось включить автозапуск"
+/etc/init.d/youtubeUnblock enable  >/dev/null || die "Не удалось включить автозапуск"
 /etc/init.d/youtubeUnblock restart >/dev/null || die "Не удалось перезапустить сервис"
 
 # [9] быстрые проверки
